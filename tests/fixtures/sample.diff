@@ -1,0 +1,28 @@
+diff --git a/src/app/core/worker.py b/src/app/core/worker.py
+index 1111111..2222222 100644
+--- a/src/app/core/worker.py
++++ b/src/app/core/worker.py
+@@ -190,8 +190,12 @@ class Worker:
+     def enqueue(self, task):
+         # existing context line
+         payload = {
+-            "user_uuid": task.user_uuid,
+-            "team_uuid": task.kwargs.get("team_uuid"),
++            key: value
++            for key, value in {
++                "user_uuid": task.user_uuid,
++                "team_uuid": task.kwargs.get("team_uuid"),
++            }.items()
++            if isinstance(value, str)
+         }
+         self.redis.hset(task.id, mapping=payload)
+         return task.id
+diff --git a/src/app/data/schemas.py b/src/app/data/schemas.py
+index 3333333..4444444 100644
+--- a/src/app/data/schemas.py
++++ b/src/app/data/schemas.py
+@@ -10,3 +10,4 @@ class ListResult(BaseModel):
+     total: int
+     limit: int
+     offset: int
++    items: list[str]

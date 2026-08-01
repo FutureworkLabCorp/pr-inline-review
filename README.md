@@ -19,7 +19,7 @@ delegated so they can't go wrong by hand. The flow:
 4. **Step 3-A — mechanical sink sweep** (`scripts/sweep.py`, see below).
 5. **Read the source** around each change: full enclosing function, call sites, existing patterns, test gaps.
 6. **Self-verification gate** — adversarially re-check every candidate and drop false positives before posting.
-7. **Post** the surviving findings as inline comments (or dry-run to console).
+7. **Emit structured findings JSON** — the model's *only* output. `scripts/review_post.py` turns it into an inline review deterministically (or dry-run to console).
 
 ## Why a sink sweep (`scripts/sweep.py`)
 
@@ -63,16 +63,49 @@ call sites for `== UNITS ==` on TS files. It is **best-effort**: if the binding 
 not in the environment, TS units are skipped with a warning and Python units still
 appear.
 
+## Why script-driven posting (`scripts/review_post.py`)
+
+The error-prone half of an inline review is not *what* to flag but *where/how* to
+attach it: line vs. side, single- vs. multi-line ranges, the ` ```suggestion `
+fence, and the GitHub API call. Making the model compute those by hand is the main
+source of broken anchors and 422s. So the model emits only **structured findings
+JSON (new-file line numbers)**, and `review_post.py` + `review_lib.py` do the rest
+deterministically:
+
+- Parse the diff and **validate every anchor** against it; snap near-miss lines
+  (≤10 away) to the nearest commentable line, reject farther ones for re-anchoring
+  (placement is the model's judgement), drop ranges that span hunks — never a 422.
+- Use GitHub's **line-based** review API (`line`/`side`/`start_line`/`start_side`)
+  in a **single batch** — single-, multi-, and cross-side suggestions all in one
+  call, no `position` arithmetic.
+- Attach the Gemini-style severity SVG badge, the `**[SEV] category** — title`
+  prefix, and the ` ```suggestion ` fence; surface (not silently rewrite)
+  suggestion sanity issues to the console — indent mismatch, a suggestion shorter
+  than the range it replaces (Apply deletes the unmentioned lines), and
+  LEFT-anchored suggestions (never applyable).
+- Build the review body as **model `_summary` markdown + deterministic severity
+  table** — verdict prose stays with the model, only the counting is scripted.
+- Decide the default event: **CRITICAL/HIGH → REQUEST_CHANGES, else COMMENT, none
+  → APPROVE**, overridable via `--event` (also a judgement call). A clean PR is
+  **not** auto-approved (console only), so the tool never self-approves its
+  author's PR.
+- On batch failure, **fall back to per-comment posting** so one bad anchor can't
+  sink the rest. `scripts/setup_check.py` verifies `gh`/auth/repo-access first, and
+  `tests/` cover the deterministic core.
+
 ## Dependencies (self-contained skill, env-only requirements)
 
 `scripts/sweep.py` and its rule file `scripts/patterns.toml` are vendored here, so
 the sweep runs **without depending on any other skill** (`sweep.py` loads the
-colocated `patterns.toml`). The only remaining requirements live in the *project
+colocated `patterns.toml`). The design-pattern judgement reference
+(`reference/patterns.md`, from the codebase-review skill) is vendored too, so
+design calls in Step 4 don't reach outside the skill either. The only remaining requirements live in the *project
 environment*, resolved via `uv run`, and each degrades gracefully if absent:
 
 | Requirement | Used for | If missing |
 |-------------|----------|------------|
 | `ruff` | Python lint lane (`ASYNC`, `S`) | lane skipped, warning |
+| `eslint` (+ repo `node_modules`) | TypeScript lint lane (local-only; `--linter` to force) | lane skipped by default, warning |
 | `tree-sitter` (+ `-typescript`) | TypeScript `== UNITS ==` | TS units skipped, warning |
 | `jedi` | type-aware DEAD-CODE / callers | falls back to `git grep` |
 | `gh` CLI | fetch diff / post review | required to post |
@@ -99,7 +132,7 @@ PR을 **로컬 소스 트리 기준으로 분석**해 결과를 GitHub에 **인�
 4. **Step 3-A — 기계적 sink 스윕**(`scripts/sweep.py`, 아래 설명).
 5. **소스 정밀 분석** — 변경을 감싸는 함수 전체·호출부·기존 패턴·테스트 갭.
 6. **자기검증 게이트** — 후보를 적대적으로 재검증해 게시 전 false positive 제거.
-7. **게시** — 살아남은 finding을 인라인 코멘트로(또는 dry-run 콘솔).
+7. **구조화 findings JSON 산출** — 모델의 *유일한* 산출물. `scripts/review_post.py`가 이를 결정적으로 인라인 리뷰로 변환(또는 dry-run 콘솔).
 
 ## 왜 sink 스윕(`scripts/sweep.py`)인가
 
@@ -137,15 +170,43 @@ DEAD-CODE 판정과 유닛의 `callers` 목록은 "이 심볼을 누가 참조�
 만든다. **best-effort**다: 바인딩이 env에 없으면 TS 유닛은 경고와 함께 skip되고
 Python 유닛은 그대로 나온다.
 
+## 왜 스크립트 기반 게시(`scripts/review_post.py`)인가
+
+인라인 리뷰에서 오류가 나는 절반은 "무엇을 지적할지"가 아니라 "**어디에 어떻게 붙일지**"다
+— line vs side, 단일 vs 여러 줄 범위, ` ```suggestion ` 펜스, GitHub API 호출. 이걸
+모델이 손으로 계산하게 하면 깨진 앵커와 422의 주원인이 된다. 그래서 모델은
+**구조화 findings JSON(new-file 줄 번호)**만 내고, `review_post.py`+`review_lib.py`가
+나머지를 결정적으로 처리한다:
+
+- diff를 파싱해 **모든 앵커를 검증** — diff 밖 줄은 ±10줄 이내만 최근접 줄로 스냅,
+  그보다 멀면 재앵커 대상으로 반려(위치 선정은 모델의 판단), hunk를 넘는 범위는 드롭.
+  422가 나지 않는다.
+- GitHub **line 기반** 리뷰 API(`line`/`side`/`start_line`/`start_side`)를 **단일 배치**로
+  호출 — 단일·여러 줄·크로스사이드 suggestion을 한 번에, `position` 산술 없음.
+- Gemini식 심각도 SVG 배지 + `**[SEV] category** — title` 접두어 + ` ```suggestion `
+  펜스 자동 부착. suggestion 위생 문제는 본문에 넣지 않고 콘솔로 표면화(조용한 재작성
+  안 함) — 들여쓰기 불일치, 범위보다 짧은 suggestion(Apply가 누락 줄을 삭제), LEFT 앵커
+  suggestion(Apply 불가).
+- 리뷰 본문 = **모델 `_summary` markdown + 결정적 심각도 집계표** — verdict 산문은
+  모델 몫이고, 스크립트는 집계만 한다.
+- event 기본 결정: **CRITICAL/HIGH → REQUEST_CHANGES, 그 외 → COMMENT, 없음 → APPROVE**,
+  이것도 판단이라 `--event`로 오버라이드 가능. 깨끗한 PR은 **자동 승인하지 않고**(콘솔만)
+  — 그래서 자기 PR을 self-approve하지 않는다.
+- 배치 실패 시 **개별 코멘트 폴백**으로 앵커 하나가 나머지를 죽이지 않게 한다.
+  `scripts/setup_check.py`가 `gh`/인증/repo 접근을 선검사하고, `tests/`가 결정적 코어를 커버한다.
+
 ## 의존성 (스킬은 자체 완결, env만 요구)
 
 `scripts/sweep.py`와 규칙 파일 `scripts/patterns.toml`이 함께 동봉돼 있어 스윕은
-**다른 스킬 없이** 동작한다(`sweep.py`가 옆의 `patterns.toml`을 로드). 남는 요구사항은
+**다른 스킬 없이** 동작한다(`sweep.py`가 옆의 `patterns.toml`을 로드). 설계 판단
+레퍼런스(`reference/patterns.md`, codebase-review 스킬에서 가져옴)도 동봉돼 있어
+Step 4의 설계 판단도 스킬 밖을 참조하지 않는다. 남는 요구사항은
 `uv run`으로 해석되는 *프로젝트 env*뿐이고, 각각 없으면 우아하게 degrade한다:
 
 | 요구사항 | 용도 | 없을 때 |
 |----------|------|---------|
 | `ruff` | Python 린트 레인(`ASYNC`, `S`) | 레인 skip, 경고 |
+| `eslint` (+ 레포 `node_modules`) | TypeScript 린트 레인(local-only; `--linter`로 강제) | 기본 skip, 경고 |
 | `tree-sitter` (+ `-typescript`) | TypeScript `== UNITS ==` | TS 유닛 skip, 경고 |
 | `jedi` | 타입인지 DEAD-CODE / callers | `git grep`으로 폴백 |
 | `gh` CLI | diff 수집 / 리뷰 게시 | 게시에 필수 |

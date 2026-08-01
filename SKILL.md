@@ -2,672 +2,265 @@
 name: pr-inline-review
 description: >
   PR 코드리뷰를 수행하고 결과를 GitHub PR에 인라인 코멘트로 게시한다.
-  로컬 소스코드 직접 분석, 프로젝트 가이드 적용, 기존 리뷰 반응 인식을 통해
-  클라우드 전용 리뷰 에이전트보다 깊이 있는 리뷰를 제공한다.
-  dry-run 모드 지원: 게시 없이 콘솔 출력만.
+  로컬 소스 직접 분석·프로젝트 가이드 적용·기존 리뷰 반응 인식으로 클라우드 전용
+  리뷰 에이전트보다 깊이 있는 리뷰를 제공한다. 내장 sink 스윕(scripts/sweep.py)이
+  결함 범주를 전수 열거하고 diff가 건드린 모든 루틴(UNITS)을 읽기 바닥선으로 강제해
+  누락을 막는다. 리뷰 깊이 모드는 없고 항상 정밀 분석하며, 게시 직전 자가 검증
+  게이트로 false positive를 걸러낸다. dry-run 지원. 좌표·suggestion·게시는 전부
+  scripts/의 테스트된 헬퍼가 결정적으로 처리한다.
 ---
 
 # PR Inline Review Skill
 
-## 인자 파싱
+이 스킬의 원칙: **모델은 "무엇을 지적할지"만 판단하고, "어디에 어떻게 붙일지"(line/side/줄수/suggestion 펜스/API)는 절대 손으로 계산하지 않는다.**
+좌표·게시는 `scripts/review_post.py`가 diff를 파싱해 결정적으로 처리한다 (인라인 실수의 원천 제거).
 
-인자 문자열에서 다음을 추출한다.
-
-| 인자 | 예시 | 설명 |
-|------|------|------|
-| PR 번호 또는 URL | `634` / `https://github.com/.../pull/634` | 필수 |
-| 저장소 | `FutureworkLabCorp/linkBrain-server` | 없으면 git remote에서 자동 탐지 |
-| dry-run 플래그 | `--dry-run` / `dry-run` / `콘솔 출력만` / `게시하지 말고` | 있으면 GitHub 게시 skip |
-| fresh 플래그 | `--fresh` / `fresh` / `기존 무시` / `기존 커멘트 무시` | 있으면 Step 1 기존 코멘트 조회 skip |
-
-**dry-run 트리거 키워드** (대소문자 무관):
-`--dry-run`, `dry-run`, `콘솔`, `출력만`, `게시하지`, `테스트`
-
-**fresh 트리거 키워드** (대소문자 무관):
-`--fresh`, `fresh`, `기존 무시`, `기존 커멘트 무시`, `skip-existing`
-
-로컬 브랜치 대상(PR 번호 없음)은 항상 dry-run으로 동작한다.
-
-## 프로젝트 스택
-
-Python, FastAPI, LangGraph, LangChain, PostgreSQL, SQLAlchemy, Alembic, Neo4j, Redis, Celery, Pydantic v2, mypy
+모델이 만들어 내는 산출물은 단 하나 — **구조화된 findings JSON**. 그게 전부다.
 
 ---
 
-## Step 0. 프로젝트 가이드 로드 (리뷰 전 필수)
+## 인자 파싱
 
-리뷰 시작 전에 이 저장소의 규칙을 먼저 읽는다. 코드 평가의 기준이 된다.
+| 인자 | 예시 | 설명 |
+|------|------|------|
+| PR 번호/URL | `634`, `https://github.com/.../pull/634` | 없으면 로컬 브랜치 리뷰(항상 dry-run) |
+| 저장소 | `FutureworkLabCorp/linkBrain-server` | 없으면 git remote 자동 탐지 |
+| dry-run | `--dry-run`, `dry-run`, `콘솔`, `출력만`, `게시하지`, `테스트` | 게시 skip |
+| fresh | `--fresh`, `fresh`, `기존 무시`, `skip-existing` | Step 1(기존 리뷰 조회) skip |
+
+- **리뷰 깊이를 고르는 모드는 없다.** 항상 로컬 소스 열람 + call-site 역추적 + 테스트 갭까지 정밀 분석한다. `--dry-run`·`--fresh`는 깊이가 아니라 게시/중복처리 스위치일 뿐이다.
+- PR 번호가 없으면 → 로컬 리뷰, **무조건 dry-run**.
+
+---
+
+## Step S. 셋업 체크 (최초 1회 / 문제 발생 시)
 
 ```bash
-# 1순위: Agent/LLM 행동 지침
-cat AGENTS.md
-
-# 2순위: 이 skill의 설계 패턴 레퍼런스
-# .claude/skills/codebase-review/patterns.md
-# .claude/skills/codebase-review/procedure.md
-
-# 3순위: 추가 가이드 (존재하는 경우)
-ls docs/
+python scripts/setup_check.py --repo <OWNER/REPO>
 ```
 
-가이드에서 리뷰 기준으로 쓸 항목을 메모한다:
-- 최소화 원칙 (Prefer minimal, focused changes)
-- 기존 패턴 우선 (Follow existing project patterns)
-- 보안·정확성·생명주기 이슈 우선 (AGENTS.md §Reviews)
-- 새 추상화 기준 (real complexity 제거 시에만)
-- 근거 없는 동의 금지 (Do not agree with proposed changes by default)
+`gh` 설치·인증·**active 계정의 org 접근 권한**·python 버전을 확인한다.
+org 저장소인데 "Could not resolve repository"가 나오면 대개 active 계정 문제:
+```bash
+gh auth switch --user <org 권한 있는 handle>
+```
+
+---
+
+## Step 0. 프로젝트 가이드 로드 (리뷰 기준)
+
+리뷰 전에 저장소 규칙을 먼저 읽는다. 코드 평가 기준이 된다.
+
+```bash
+cat AGENTS.md 2>/dev/null                        # 1순위: Agent/리뷰 지침
+ls docs/ 2>/dev/null                             # 2순위: 추가 가이드
+cat CLAUDE.md 2>/dev/null                        # 3순위
+```
+
+메모할 기준: 최소 변경 원칙 / 기존 패턴 우선 / 보안·정확성·생명주기 우선 / 새 추상화는 real complexity를 제거할 때만 / 근거 없는 동의 금지.
+
+**설계 패턴 레퍼런스(스킬 동봉):** `$SKILL_DIR/reference/patterns.md` — DB 컬럼 vs JSONB, hook/transaction 경계, ACL 적용 위치, RAG 파이프라인, lifecycle state machine 등 §1~§16 판단 기준. 전부 미리 읽지 말고 **Step 4에서 설계 판단이 걸리는 finding이 나올 때 해당 §만** 참조한다. (`$SKILL_DIR` = 이 SKILL.md가 있는 디렉토리의 절대경로)
+
+### 프로젝트 스택 (linkBrain-server 기준)
+Python, FastAPI, LangGraph, LangChain, PostgreSQL, SQLAlchemy, Alembic, Neo4j, Redis, Celery, Pydantic v2, mypy
 
 ---
 
 ## Step 0.5. 선행 분석 결과 수신 (있을 경우)
 
-`/codebase-review` 또는 다른 분석이 이미 완료됐다면 그 결과를 이슈 후보 목록으로 받아들인다.
+`/codebase-review` 등 다른 분석이 이미 완료됐다면 그 결과를 이슈 후보 목록으로 받아들인다 — Step 3-A 스윕의 HITS/UNITS와 **같은 성격의 후보 소스**다.
 
-- 선행 분석의 리스크 항목을 Step 4의 출발점으로 삼는다 (재발굴 중복 제거)
-- Step 1에서 읽은 기존 GitHub 코멘트와 대조해 이미 제기된 것은 필터링한다
-- 선행 분석이 없으면 이 Step을 skip하고 Step 1로 이동한다
-
----
-
-## Step 1. 기존 PR 리뷰 및 반응 읽기 (중복 방지)
-
-**fresh 플래그가 있으면 이 Step 전체를 skip하고 Step 2로 바로 이동한다.**
-모든 이슈를 새로 발굴하고 기존 코멘트와의 중복을 허용한다.
-
-**우리가 클라우드 에이전트보다 유리한 첫 번째 이유.**
-이미 논의된 이슈를 다시 제기하지 않는다.
-
-```bash
-# PR 기본 정보
-gh pr view <PR_NUMBER> --repo <OWNER/REPO> \
-  --json number,title,body,baseRefName,headRefName
-
-# 기존 리뷰 목록 (state: COMMENTED / APPROVED / CHANGES_REQUESTED)
-gh api repos/<OWNER/REPO>/pulls/<PR_NUMBER>/reviews \
-  | python3 -c "
-import json,sys
-reviews = json.load(sys.stdin)
-for r in reviews:
-    print(f'review_id={r[\"id\"]} user={r[\"user\"][\"login\"]} state={r[\"state\"]}')
-    print(r['body'][:300])
-    print()
-"
-
-# 최근 인라인 코멘트 30개 (오래된 코멘트는 이미 resolved됐거나 무관할 가능성이 높음)
-gh api "repos/<OWNER/REPO>/pulls/<PR_NUMBER>/comments?sort=created&direction=desc&per_page=30" \
-  | python3 -c "
-import json,sys
-comments = json.load(sys.stdin)
-for c in comments:
-    print(f'path={c[\"path\"]} line={c.get(\"line\")} author={c[\"user\"][\"login\"]}')
-    print(c['body'][:200])
-    if c.get('reactions', {}).get('total_count', 0) > 0:
-        print(f'  reactions: +1={c[\"reactions\"][\"+1\"]} -1={c[\"reactions\"][\"-1\"]}')
-    print()
-"
-
-# PR author의 reply 코멘트 (이슈에 대한 반박/설명 확인)
-gh api repos/<OWNER/REPO>/issues/<PR_NUMBER>/comments \
-  | python3 -c "
-import json,sys
-comments = json.load(sys.stdin)
-for c in comments:
-    print(f'author={c[\"user\"][\"login\"]}')
-    print(c['body'][:300])
-    print()
-"
-```
-
-**읽은 후 판단:**
-- 👎 반응이 달린 코멘트 → 작성자가 반박했거나 잘못된 지적으로 판단된 것 → **skip**
-- `resolved` / PR author의 명시적 반박 → **skip**
-- 이미 같은 파일·줄에 동일 패턴의 코멘트가 있으면 → **skip**
+- 선행 분석의 리스크 항목을 Step 4의 출발점으로 삼는다(재발굴 중복 제거).
+- Step 1에서 읽은 기존 GitHub 코멘트와 대조해 이미 제기된 것은 필터링한다.
+- 선행 분석이 없으면 이 Step을 skip하고 Step 1로 이동한다.
+- **후보일 뿐이다.** 선행 분석 항목도 Step 6 검증 게이트를 그대로 거친다(받아쓰지 않는다).
 
 ---
 
-## Step 2. diff 수집 및 position 매핑
+## Step 1. 기존 리뷰·반응 읽기 (중복 방지)  — `--fresh`면 skip
+
+**클라우드 에이전트보다 유리한 첫 번째 이유: 이미 논의된 걸 다시 지적하지 않는다.**
 
 ```bash
-gh pr diff <PR_NUMBER> --repo <OWNER/REPO>
+gh pr view <PR> --repo <REPO> --json number,title,body,baseRefName,headRefName
+gh api repos/<REPO>/pulls/<PR>/reviews --jq '.[] | "\(.user.login) \(.state): \(.body[0:200])"'
+gh api "repos/<REPO>/pulls/<PR>/comments?sort=created&direction=desc&per_page=30" \
+  --jq '.[] | "\(.path):\(.line) @\(.user.login) [+1=\(.reactions["+1"]) -1=\(.reactions["-1"])] \(.body[0:160])"'
+gh api repos/<REPO>/issues/<PR>/comments --jq '.[] | "@\(.user.login): \(.body[0:240])"'
 ```
 
-Python으로 diff를 파싱해 `{(path, new_lineno): position}` 매핑 구성:
-
-```python
-import re
-
-def parse_diff_positions(diff_text):
-    mapping = {}  # (path, new_lineno) -> position
-    path = None
-    pos = 0
-    new_line = 0
-    for raw in diff_text.splitlines():
-        if raw.startswith("diff --git"):
-            path = None; pos = 0; new_line = 0
-        elif raw.startswith("+++ b/"):
-            path = raw[6:]
-            pos = 0; new_line = 0
-        elif raw.startswith("@@"):
-            m = re.search(r'\+(\d+)', raw)
-            if m:
-                new_line = int(m.group(1)) - 1
-            pos += 1
-        elif path and raw[:1] in ("+", "-", " "):
-            pos += 1
-            if raw[:1] in ("+", " "):
-                new_line += 1
-                mapping[(path, new_line)] = pos
-    return mapping
-```
+판단:
+- 👎 반응 / PR author 반박 / resolved / 동일 파일·줄 동일 지적 → **해당 이슈 제외**.
 
 ---
 
-## Step 3. 로컬 소스코드 직접 분석
-
-**우리가 클라우드 에이전트보다 유리한 두 번째 이유.**
-diff 텍스트만 보지 않는다. 변경된 파일을 실제로 열어서 전체 컨텍스트를 파악한다.
-
-### 3-0. 브랜치 일치 여부 확인 (소스 접근 전략 결정)
+## Step 2. diff 수집 (게시 스크립트가 다시 파싱하므로 여기선 "읽기"용)
 
 ```bash
-# Step 1에서 읽은 PR headRefName과 현재 로컬 브랜치를 비교
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-PR_HEAD=<headRefName from Step 1>
-
-if [ "$CURRENT_BRANCH" = "$PR_HEAD" ]; then
-    echo "same-branch: Read 툴로 로컬 파일 직접 접근 가능"
-else
-    echo "different-branch: gh API 또는 git fetch 필요"
-fi
+gh pr diff <PR> --repo <REPO>
 ```
 
-**브랜치 일치 시 (same-branch):** Read 툴로 로컬 파일 직접 접근.
+`+` 줄에만 집중한다. `-` 줄은 리포트하지 않는다.
+> 좌표(line/side/position)는 절대 손으로 세지 않는다 — findings에는 **new-file 줄 번호만** 적고, 나머지는 `review_post.py`가 계산한다.
 
-**브랜치 불일치 시 (different-branch):** 두 가지 방법 중 선택:
+---
 
+## Step 3. 소스 분석 (항상 정밀)
+
+**클라우드보다 유리한 두 번째 이유: diff 텍스트만 보지 않는다.** 리뷰 깊이 모드는 없다 — 매번 아래를 전부 수행한다.
+
+브랜치 전략 먼저 결정:
 ```bash
-# 방법 A: git fetch 후 git show (파일 전체 내용)
-git fetch origin <PR_HEAD> -q
-git show origin/<PR_HEAD>:<path/to/file>
-
-# 방법 B: GitHub Contents API (체크아웃 없이)
-gh api repos/<OWNER/REPO>/contents/<path>?ref=<PR_HEAD> \
-  --jq '.content' | base64 -d
+CUR=$(git rev-parse --abbrev-ref HEAD); echo "PR head=<headRefName> / current=$CUR"
 ```
+- **same-branch:** Read 툴로 로컬 파일 직접 열람.
+- **different-branch:** `git fetch origin <PR_HEAD> -q && git show origin/<PR_HEAD>:<path>` (파일 전체). call-site grep은 항상 로컬에서 가능.
+  > **주의:** different-branch에서 `git diff --name-only <MB> HEAD`는 **현재 체크아웃 브랜치 기준**이라 사용 금지 — 변경 파일 목록은 Step 2의 diff(`+++ b/<path>`) 또는 스윕 출력에서 얻는다.
 
-방법 A가 더 빠르고 call site grep도 로컬에서 가능하므로 기본으로 사용한다.
-단, `git fetch`가 느리거나 불필요한 경우(파일 1~2개)는 방법 B도 무방하다.
+3-1. 변경 함수/클래스의 **주변 전체 컨텍스트**(hunk 밖 포함, 클래스/모듈 구조, import) 읽기.
+3-2. **call-site 역추적**:
+```bash
+grep -rn "함수명\|클래스명" src/ --include="*.py" -l
+```
+타입 흐름 체크리스트:
+- `isinstance(x, str)` / `if x` 필터 → 실제 caller가 다른 타입(UUID 등)을 넣을 수 있나?
+- `json.dumps`↔`json.loads` 왕복 전후 타입이 바뀌나 (uuid.UUID→str)?
+- in-memory 캐시 vs DB/Redis 로드 경로의 타입이 일치하나?
 
-> **주의:** 브랜치 불일치 시 `git diff --name-only $MERGE_BASE HEAD`는 현재 체크아웃 브랜치 기준이라 사용 금지. 파일 목록은 Step 2에서 얻은 diff에서 추출한다.
+3-3. **기존 패턴 대조:** `grep -rn "pattern" src/` — 새 코드가 기존 패턴을 따르나, 불일치 추상화를 들여오나.
+3-4. **테스트 갭:** 새 `+` 코드 경로(분기·루프·early return)를 열거하고 테스트 존재 여부 매핑. 미커버는 LOW/MEDIUM.
+3-5. **외부 스토리지 값의 단위·타입을 주장하는 이슈**라면, 그 write 경로를 grep으로 확인한 뒤 리포트 (단위 오해 false-positive 방지).
 
-### 3-A. 기계적 sink 스윕 (내장 sweep.py)
+---
 
-수동 grep(3-3) 전에 **이 스킬에 내장된 `scripts/sweep.py`**를 한 번 돌려 후보 결함 위치를 기계적으로 수집한다. Python·Shell·TypeScript를 파일 확장자로 자동 디스패치하므로 언어별 grep을 직접 짜지 않아도 된다. 출력의 `== HITS ==`/`== MANUAL ==`을 **Step 4 이슈 후보의 출발점**으로 삼는다.
+## Step 3-A. 기계적 sink 스윕 (내장 `scripts/sweep.py`) — 커버리지 강제
 
-> **자체 완결.** `sweep.py`와 규칙 파일 `patterns.toml`이 `scripts/`에 함께 들어있어 `code-review-sweep` 등 다른 스킬 없이 독립 동작한다(`sweep.py`가 옆의 `patterns.toml`을 로드). 남는 의존성은 스킬이 아니라 **프로젝트 env**뿐 — ruff(Python 린트)와 tree-sitter(TS UNITS)는 `uv run`으로 프로젝트 환경에서 해석된다. 아래 명령의 `$SKILL_DIR`는 **이 SKILL.md가 있는 디렉토리의 절대경로**로, cwd가 바뀌어도 스크립트를 찾게 한다.
-
-`sweep.py`는 diff 범위(추가된 줄)만 스캔하되 **파일 본문을 디스크에서 읽고**(regex/AST), ruff/eslint 린터는 실제 파일에 실행한다. 따라서 리뷰 대상 트리가 디스크에 존재해야 한다. 3-0에서 정한 전략에 따라 갈린다.
-
-**same-branch:** 현재 워킹트리가 곧 PR head이므로 그대로 실행한다.
+수동 분석(Step 3)은 "가장 눈에 띄는" 문제는 찾지만 **커버리지**를 보장하지 못한다. 스윕은 그 강제 장치로, discovery를 기계화해 모델이 판단에만 집중하게 한다. **이 스킬에 내장**돼 있어(`scripts/sweep.py` + `scripts/patterns.toml`) 다른 스킬 의존이 없다.
 
 ```bash
-SKILL_DIR=<이 스킬 디렉토리의 절대경로>
+SKILL_DIR=<이 SKILL.md가 있는 디렉토리의 절대경로>
+
+# same-branch: 현재 워킹트리가 곧 PR head
 uv run python "$SKILL_DIR/scripts/sweep.py" --base origin/develop
-# eslint는 로컬 node_modules가 있을 때만 자동 실행됨 (없으면 조용히 skip)
-```
 
-**different-branch:** 현재 브랜치를 보존한 채 PR head를 **별도 worktree로 materialize**한 뒤 그 안에서 실행한다. 체크아웃(브랜치 전환)이 아니라 detached worktree라 원본 디렉토리·현재 브랜치·스테이징에 영향이 없다.
-
-```bash
+# different-branch: 브랜치 전환 없이 PR head를 detached worktree로 materialize
 git fetch origin <PR_HEAD> -q
-WT=$(mktemp -d)/pr-<PR_NUMBER>
-git worktree add --detach "$WT" FETCH_HEAD -q
-
+WT=$(mktemp -d)/pr-<PR>; git worktree add --detach "$WT" FETCH_HEAD -q
 MB=$(git merge-base origin/develop FETCH_HEAD)
 ( cd "$WT" && uv run python "$SKILL_DIR/scripts/sweep.py" --base "$MB" )
-
-git worktree remove "$WT" --force   # 스윕 후 즉시 정리
+git worktree remove "$WT" --force
 ```
 
-**린터 정책:** worktree에는 `node_modules`가 없으므로 eslint 레인은 **기본적으로 skip**된다(regex 5종·AST·dead-code·ruff는 정상 동작). eslint까지 강제로 돌리려면 원본의 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 다만 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고, TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: AxFlow `pr-code-review`)에 맡긴다.
+출력 세 섹션을 이렇게 소비한다:
+- **`== HITS ==` / `== MANUAL ==`** — Step 4 이슈 후보의 출발점(각 행은 후보일 뿐, 반드시 Step 6에서 검증). 카테고리별 전수라 "빠뜨림"을 막는다.
+- **`== UNITS ==`** — diff가 건드린 **모든 루틴**(Python=`ast`, TS/TSX=tree-sitter). 이게 "무엇을 읽을지"의 **바닥선**이다: 패턴이 침묵한 의도(intent) 버그에 닿는 통로. 각 UNIT을 `Read(file, offset, limit)`로 읽고 Step 4에서 finding 또는 "read, clean"으로 처리한다. `func`=함수 통째(데코 포함), `block`=거대 함수의 hunk 블록만(+`oversized-fn` 플래그=자체 finding 후보), `module`=모듈 레벨. `callees`/`callers`는 HIT/타입경계가 필요를 만들 때만 한 홉 확장.
 
-**`== UNITS ==` 소비 (스윕의 핵심 이득).** HITS는 패턴이 아는 결함만 잡지만, `== UNITS ==`는 diff가 건드린 **모든 루틴**(Python=stdlib `ast`, TypeScript/TSX=tree-sitter)을 열거한다 — 이게 "무엇을 읽을 것인가"의 바닥선이고, 패턴이 침묵한 의도(intent) 버그에 닿는 통로다. 각 UNIT을 `Read(file, offset, limit)`로 지정 범위만큼 읽는다: `func`는 함수 통째(데코레이터 포함), `block`은 hunk 감싸는 블록만(+`oversized-fn` 플래그는 그 자체가 finding 후보), `module`은 모듈 레벨 변경. `callees`/`callers`는 **한 홉 확장** 대상 — HIT나 타입 경계가 필요를 만들 때만 그 본문을 추가로 읽고, 그래프를 더 따라가지 않는다. Step 4에서 **모든 UNIT에 finding 또는 "read, clean" 한 줄**을 남긴다. (worktree에서 실행할 때 tree-sitter가 프로젝트 env에 있어야 TS UNITS가 나온다 — worktree는 같은 프로젝트라 `cd $WT && uv run`이면 해결. 없으면 `# WARNING: TS units skipped`가 뜨고 Python UNITS만 나온다.)
+**린터 정책 (ruff / eslint).** ruff(Python)는 순수 정적 린트라 항상 돈다. **eslint(TypeScript)**는 트리의 `node_modules`(플러그인·파서·tsconfig)가 필요해 **local-only**다 — 스캔 트리에 `node_modules/.bin/eslint`가 있을 때만 자동 실행되고, 없으면 조용히 skip(경고 한 줄)된다. 그래서 worktree(리모트 PR)엔 `node_modules`가 없어 eslint는 기본 빠지고 regex·AST·dead-code·ruff는 정상 동작한다. eslint까지 강제하려면 원본 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고 **TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: AxFlow `pr-code-review`)에 맡긴다**.
 
-> **주의:** `sweep.py`는 discovery만 담당한다. 게시용 diff position 매핑(Step 2·6)은 별개이며 이 스윕이 좌표를 주지 않는다. HITS/UNITS는 후보·읽기대상일 뿐이므로 Step 4의 검증(false positive 제거)을 반드시 거친다.
-
-### 3-1. 변경 파일 목록 확인
-
-**same-branch인 경우:**
-```bash
-MERGE_BASE=$(
-  git merge-base origin/develop HEAD 2>/dev/null ||
-  git merge-base origin/main HEAD 2>/dev/null
-)
-git diff --name-only $MERGE_BASE HEAD
-```
-
-**different-branch인 경우:**
-Step 2에서 파싱한 diff의 `+++ b/<path>` 줄에서 파일 목록을 추출한다 (별도 git 명령 불필요).
-
-### 3-2. 각 파일의 전체 내용 읽기
-
-diff에서 변경된 함수/클래스를 확인한 뒤, 그 **주변 전체 컨텍스트**를 읽는다:
-- 변경된 함수의 전체 본문 (hunk 경계 밖의 줄 포함)
-- 함수가 속한 클래스/모듈의 전체 구조
-- import 목록 전체
-
-**same-branch:** Read 툴로 직접 읽는다.
-
-**different-branch:** `git show origin/<PR_HEAD>:<path>` 결과를 분석한다.
-단, call site 역추적(3-3)은 항상 현재 로컬 브랜치 기준 grep이 가능하다 — 호출자가 PR 브랜치가 아닌 쪽에 있으므로 오히려 정확하다.
-
-### 3-3. Call site 역추적 (타입·패턴 추적의 핵심)
-
-```bash
-# 변경된 함수/클래스를 실제로 호출하는 곳 탐색
-grep -rn "함수명\|클래스명" src/ --include="*.py" -l
-
-# 타입 필터가 있으면 (isinstance, if value 등) 실제로 어떤 타입이 들어오는지 역추적
-grep -n "team_uuid\|workspace_uuid" src/app/data/service.py | head -20
-```
-
-**타입 흐름 추적 체크리스트:**
-- `isinstance(value, str)` / `if value` 필터가 있는가?
-  - 그렇다면: 실제 call site에서 `str` 외의 타입(UUID 객체 등)이 들어올 수 있는가?
-- 직렬화(json.dumps) → 역직렬화(json.loads) 왕복 경계가 있는가?
-  - 그렇다면: 왕복 전후 타입이 달라지는가? (uuid.UUID → str 등)
-- in-memory 캐시와 DB/Redis 로드 경로가 공존하는가?
-  - 그렇다면: 두 경로의 타입이 일치하는가?
-
-### 3-4. 기존 패턴 대조
-
-```bash
-# 유사한 패턴이 이미 코드베이스에 있는지 확인
-grep -rn "pattern_keyword" src/ --include="*.py" | head -20
-```
-
-새 코드가 기존 패턴을 따르는지, 아니면 불일치하는 추상화를 도입하는지 판단한다.
-
-### 3-5. 테스트 커버리지 갭 탐지
-
-새로 추가된 `+` 코드 경로(함수 분기, 루프, early return)를 열거한 뒤, 테스트 파일에서 각 경로를 커버하는 테스트가 있는지 매핑한다.
-
-```
-| 신규 코드 경로              | 대응 테스트                         | 상태 |
-|-----------------------------|-------------------------------------|------|
-| single-doc avg_chunk_tokens | test_avg_chunk_tokens_computed_*    | ✅   |
-| all-docs total_chars        | -                                   | ❌   |
-```
-
-커버되지 않은 경로가 있으면 LOW 또는 MEDIUM 이슈로 리포트한다.
+> **env 의존만 남음(스킬 의존 아님)**: ruff(Python 린트)·eslint(TS 린트, local-only)·tree-sitter(TS UNITS)·jedi(타입인지 DEAD-CODE/callers)는 `uv run`으로 프로젝트 env에서 해석되고, 없으면 각 레인만 조용히 skip/폴백된다(§README). 스윕은 discovery만 담당 — 게시 좌표는 Step 7의 `review_post.py`가 별도로 계산한다.
 
 ---
 
-## Step 4. 분석 기준 (AGENTS.md 기반)
+## Step 4. 분석 기준 & false-positive 필터
 
-diff의 `+` 줄에 집중. `-` 줄은 리포트하지 않는다. **근거 없는 칭찬 금지.**
+### 우선순위 (AGENTS.md §Reviews)
+1. 정확성(논리 버그·조건 오류·async·edge case) → 2. 동작 회귀 → 3. 보안(인증 우회·권한 bypass·null) → 4. 생명주기(트랜잭션 원자성·리소스 누수·phantom 상태) → 5. 누락 테스트 → 6. 타입 안전성 → 7. 확장성 → 8. 패턴 일관성 → 9. 스타일(LOW만).
 
-### 우선순위 (AGENTS.md §Reviews 순서)
+설계 판단이 걸리는 finding(DB 모델 선택, hook vs transaction, ACL 위치, RAG lifecycle, state machine 등)은 `$SKILL_DIR/reference/patterns.md`의 해당 §를 근거로 삼는다.
 
-1. **정확성(correctness)** — 논리 버그, 조건 오류, async 문제, edge case
-2. **동작 회귀(behavioral regression)** — 기존 기능이 조용히 깨지는가
-3. **보안 리스크** — 인증 우회, 권한 bypass, null 체크 부재
-4. **생명주기 이슈** — 트랜잭션 원자성, 리소스 누수, phantom 상태
-5. **누락된 테스트** — 핵심 경로에 테스트가 없는가
-6. **타입 안전성** — isinstance 필터 오류, 직렬화 타입 불일치, 스키마 과소 일반화
-7. **확장성** — 너무 구체적인 타입 힌트, 하드코딩, 미래 타입 추가 시 깨짐
-8. **패턴 일관성** — 기존 코드베이스 패턴과 불일치
-9. **스타일** — LOW에만, 생략 가능
-
-### 이슈 레코드 형식
-
-```python
-{
-    "path": "src/app/core/worker.py",
-    "new_lineno": 196,
-    "severity": "HIGH",        # HIGH | MEDIUM | LOW
-    "category": "type-safety", # security | bug | regression | lifecycle | type-safety | extensibility | pattern | style
-    "title": "UUID object silently dropped by isinstance(value, str)",
-    "body": "..."
-}
-```
-
-### 보고 전 검증 (false positive 방지)
-
-이슈를 보고하기 전에 **diff에서 직접 확인한다**:
-- "이 문제가 이미 코드에서 처리됐는가?" (exists=True, fallback 값, str() 변환 등)
-- "이 코드 경로가 실제로 실행 가능한가?"
-- "Step 1에서 읽은 기존 코멘트에서 이미 논의된 이슈인가?"
-- "외부 스토리지(LightRAG KV, Redis, 서드파티 API)에서 읽어온 값의 단위·타입을 주장하는 이슈라면, 해당 스토리지의 write 경로 코드를 grep해서 실제 저장 방식을 확인한 뒤 리포트한다." (단위 오해로 인한 false positive 방지)
+### 보고 전 자기검증 (반드시)
+- 이미 코드에서 처리됐나? (exists 체크·fallback·str() 변환 등)
+- 이 경로가 실제 실행 가능한가?
+- Step 1에서 이미 논의된 이슈인가?
+- **근거 없는 칭찬 금지. 기본적으로 제안에 동의하지 않는다 (AGENTS.md).**
 
 ---
 
-## Step 5. 코멘트 본문 작성
+## Step 5. findings 초안 작성
 
-### 형식
+지적 후보를 **리스트**로 정리한다(아직 최종본 아님 — Step 6에서 걸러진다). 첫 원소로 `_summary`(선택)를 넣을 수 있다 — 리뷰 본문에 들어갈 **자유 markdown**으로, PR 개요·verdict 산문·인라인로 안 가는 non-blocking 언급을 여기에 쓴다. 요약 산문은 모델의 몫이고, 스크립트는 그 뒤에 심각도 집계표만 결정적으로 부착한다.
 
-```markdown
-![high](https://www.gstatic.com/codereviewagent/high-priority.svg) **[HIGH] type-safety** — UUID object silently dropped by `isinstance(value, str)`
-
-`task.kwargs`의 `team_uuid`가 `uuid.UUID` 객체로 들어오면 `isinstance(value, str)` 필터에서
-탈락해 Redis metadata에 저장되지 않는다. 이후 `get_task()`는 해당 UUID를 phantom으로 판단해
-None 반환 → 404.
-
-실제 호출처(`upload_share_process`)에서 현재는 str이 들어오지만, 다른 caller가 추가되면
-조용히 깨진다.
-
-```suggestion
-    payload = {
-        key: str(value)
-        for key, value in {
-            "user_uuid": task.user_uuid,
-            "team_uuid": task.kwargs.get("team_uuid"),
-            "workspace_uuid": task.kwargs.get("workspace_uuid"),
-        }.items()
-        if value is not None and str(value)
-    }
-```
+```json
+[
+  {"_summary": "OCR 실패 알림 dedup 누락 + 초대 read_at 시맨틱 점검.\n\n**머지 전 HIGH 1건 해결 필요.** 나머지는 non-blocking."},
+  {
+    "path": "src/app/notifications/service.py",
+    "line": 142,
+    "start_line": 138,
+    "severity": "HIGH",
+    "category": "bug",
+    "title": "OCR 실패 알림이 ref_key=None으로 무한 누적",
+    "explanation": "failed 루프가 document_uuid=None으로 호출 → ref_key=None → Postgres에서 매번 새 행 INSERT.",
+    "suggestion": ["    ref_key = f\"document_ocr:{document_name}\"", "    await _upsert_notification(db, user_uuid, ref_key, ...)"]
+  }
+]
 ```
 
-**핵심: `suggestion` 블록 사용**
-- GitHub의 ` ```suggestion ` 문법을 항상 포함한다
-- 리뷰어가 one-click으로 적용할 수 있는 수준의 구체적 수정안을 제시한다
-- suggestion이 불가능한 경우(설계 변경 필요)만 텍스트 설명으로 대체
+**규칙 (엄수):**
+- `line` = **new-file 줄 번호** (diff의 `+`/컨텍스트 줄). position 계산 금지.
+- 여러 줄 교체는 `start_line`(같은 hunk 내, `line`보다 작거나 같음)만 추가. side는 기본 RIGHT.
+- `suggestion`은 **교체 후 남길 줄들의 배열**. ` ```suggestion ` 펜스를 직접 쓰지 않는다 — 스크립트가 감싼다.
+- **범위는 통째로 교체된다.** GitHub Apply는 `start_line`~`line` **전 줄을 삭제하고 suggestion 전체를 삽입**한다. 범위 안에서 유지할 줄도 suggestion에 반드시 포함한다 — 부분 교체에서 줄을 빠뜨리면 Apply가 그 줄을 지운다(스크립트가 범위보다 짧은 suggestion을 경고). 줄 삽입으로 suggestion 줄 수 > 범위 줄 수가 되는 건 정상.
+- **side 선택:** `+`/컨텍스트 줄만이면 RIGHT(기본). `-`줄만 있는 위치에는 suggestion 불가(이미 삭제된 줄 — `explanation`으로 서술, 스크립트가 경고). `-`/`+` 혼합 블록 전체 교체는 `start_side: "LEFT"`(old 줄 번호) + `side: "RIGHT"`(new 줄 번호)로 가능.
+- suggestion 각 줄의 **들여쓰기는 실제 파일과 정확히 일치**시킨다 (스크립트가 첫 줄 들여쓰기 불일치를 경고로 잡아준다).
+- 설계 변경이 필요해 one-click suggestion이 불가능하면 `suggestion`을 빼고 `explanation`에 방향만 서술.
+- `category`: security | bug | regression | lifecycle | type-safety | extensibility | pattern | style
 
-### suggestion 범위 지정 원칙
-
-**핵심: "apply 후 파일에서 어떤 줄을 교체하는가"로 범위를 결정한다.**
-
-GitHub는 범위 전체를 삭제하고 suggestion 줄 전체를 삽입한다.  
-suggestion 본문에는 **교체 결과만** 넣는다 — 범위 밖에 있는 줄을 포함시키면 중복된다.
-
-#### side 선택 기준
-
-| 범위 내 줄 구성 | start_side | side |
-|----------------|-----------|------|
-| `+` 줄 또는 ` `(맥락) 줄만 | RIGHT | RIGHT |
-| `-` 줄 + `+` 줄 혼합 | LEFT | RIGHT |
-| `-` 줄만 | LEFT | LEFT — suggestion apply 불가 (이미 삭제된 줄) |
-
-**suggestion이 apply 가능하려면 `side=RIGHT`이어야 한다.**
-
-#### Case A — RIGHT→RIGHT
-
-```
-start_line=1512, start_side=RIGHT
-line=1514,       side=RIGHT
-```
-
-GitHub는 R1512~R1514 전체를 삭제하고 suggestion 줄 전체를 삽입한다.  
-범위 안에서 유지하고 싶은 줄은 suggestion에도 그대로 포함해야 한다.
-
-줄을 삽입해서 suggestion 줄 수 > 범위 줄 수가 되는 것은 정상이다 — GitHub가 의도대로 처리한다.
-
-**⚠️ 주의: 범위 안 일부 줄만 바꾸고 나머지는 유지하는 경우**  
-suggestion 줄 수 = 범위 줄 수여야 한다.  
-줄 수가 다르면 GitHub가 유지하려던 줄까지 삭제·추가한다.  
-예: R1096~R1098(3줄) 중 R1097만 교체 → suggestion도 반드시 3줄.
-
-예시 — R1512~R1514 범위에서 raise 앞에 줄 삽입 (줄 수 달라도 OK):
-````markdown
-```suggestion
-        msg = f"no approved OCR corrections for {doc_id}; nothing to reindex"
-        logger.error("[OCR] %s", msg)
-        async with async_context_session() as db:
-            await rag_service.update_document_status(
-                db, existing_doc.uuid, RAGStatus.FAILED, error_message=msg,
-            )
-        raise RuntimeError(msg)
-```
-````
-
-예시 — R1096~R1098 중 R1097만 교체 (줄 수 일치 필수):
-````markdown
-```suggestion
-        "ack": (
-            {"acked_at": ack.acked_at.isoformat(), "acked_by": ack.acked_by}
-            if ack is not None
-```
-````
-
-#### Case B — LEFT→RIGHT
-
-```
-start_line=1745, start_side=LEFT   ← old file(삭제 줄) 번호
-line=1742,       side=RIGHT        ← new file(추가 줄) 번호
-```
-
-`-` 줄과 `+` 줄이 섞인 diff 블록 전체를 교체할 때 사용한다.  
-`line - start_line + 1` 공식은 적용되지 않는다 (LEFT·RIGHT는 서로 다른 파일 기준).  
-suggestion 본문에는 교체 후 파일에 남길 내용만 넣는다.
+> diff **밖** 줄을 고쳐야 하면 suggestion 대신 `explanation`에 `Before/After` 코드블록으로 안내한다 (해당 줄은 인라인 앵커가 불가하므로).
 
 ---
 
-API 호출 시 `position` 대신 `start_line`/`line` 사용 (Step 6-4 참고).
+## Step 6. 검증 게이트  ← 게시 전 false-positive 제거 (품질의 핵심)
 
-**공백 일치 주의:** suggestion 내 들여쓰기가 실제 파일과 정확히 같아야 Apply 버튼이 올바르게 동작한다.
+**초안을 그대로 올리지 않는다.** Step 5의 후보 전체를 한 번에 놓고, 각 항목을 **적대적으로 다시 검증**한다. "내가 지적한 게 진짜 문제인가"를 스스로 반박해 보는 단계다. 리뷰봇 신뢰를 가장 크게 깎는 게 그럴듯하지만 틀린 지적이므로, 이 게이트가 체감 품질을 좌우한다.
 
-### diff 외부 줄 수정 안내
+각 후보에 대해 아래를 실제 코드(Step 3에서 읽은 소스·호출부)와 대조해 판정한다:
 
-`suggestion` 블록은 **PR diff에 포함된 줄에만** 적용된다.
-수정이 필요한 줄이 diff 밖에 있을 때는 unified diff 코드블록으로 안내한다.
+1. **진짜 버그인가?** — 주장한 실패 시나리오가 실제로 성립하는가. 구체적 입력/상태 → 잘못된 출력/크래시로 이어지는 경로를 댈 수 있나. 못 대면 → **드롭**.
+2. **이미 처리됐나?** — 상위/하위에 exists 체크·fallback·try/except·타입 변환·기본값이 이미 있나. 있으면 → **드롭**.
+3. **실행 경로가 도달 가능한가?** — dead code·불가능한 분기·호출되지 않는 함수면 → **드롭 또는 LOW 강등**.
+4. **이미 논의됐나?** — Step 1의 기존 코멘트/반응과 중복이면 → **드롭**.
+5. **근거 있는 심각도인가?** — 정확성/보안/생명주기 근거 없이 취향·스타일이면 → **LOW 강등 또는 드롭**. (AGENTS.md: 근거 없는 동의·지적 금지)
+6. **suggestion이 실제로 맞나?** — 제안 코드가 컴파일/동작하고 주변 들여쓰기·시그니처와 일치하나. 어긋나면 → suggestion 제거하고 `explanation`만 남김.
 
-**작성 절차:**
-1. Read 툴로 해당 파일을 읽어 **정확한 줄 번호를 Read 출력에서 확인한다.** 줄 번호를 추측하지 않는다.
-2. 변경 줄 위아래로 컨텍스트 3줄을 포함해 `@@` 헤더를 계산한다.
-
-```
-context = 3
-old_start = change_line - context
-old_count = context + (제거 줄 수) + context
-new_count = context + (추가 줄 수) + context
-```
-
-3. 코멘트 본문에 ` ```diff ` 블록으로 삽입한다:
-
-````markdown
-```diff
-@@ -4224,7 +4224,7 @@
-     context_line_above_2
-     context_line_above_1
--    old_code
-+    new_code
-     context_line_below_1
-     context_line_below_2
-```
-````
-
-변경 범위가 넓거나 `@@` 계산이 복잡하면 Before/After 블록으로 대체한다:
-
-````markdown
-File: `path/to/file.py`  line 4226
-
-Before:
-```python
-    old_code
-```
-
-After:
-```python
-    new_code
-```
-````
-
-심각도 접두어:
-- `**[HIGH] security**` — 인증·권한·데이터 노출
-- `**[HIGH] bug**` — 장애·데이터 손상
-- `**[HIGH] type-safety**` — 타입 불일치로 인한 silent failure
-- `**[MEDIUM] bug**` / `**[MEDIUM] lifecycle**` / `**[MEDIUM] extensibility**`
-- `**[LOW] pattern**` / `**[LOW] style**`
-
-### 심각도 배지 아이콘
-
-코멘트 본문 첫 줄의 심각도 접두어 앞에 배지 SVG를 붙인다 (Gemini code review와 동일한 시각 규약):
-
-| 심각도 | 배지 마크다운 |
-|--------|--------------|
-| CRITICAL | `![CRITICAL](https://www.gstatic.com/codereviewagent/critical.svg)` |
-| HIGH | `![HIGH](https://www.gstatic.com/codereviewagent/high-priority.svg)` |
-| MEDIUM | `![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg)` |
-| LOW | `![LOW](https://www.gstatic.com/codereviewagent/low-priority.svg)` |
-
-적용 예 (본문 첫 줄):
-
-```markdown
-![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg) **[MEDIUM] bug** — 제목
-```
+**살아남은 항목만** 최종 `findings.json`으로 파일에 쓴다. 이게 모델의 유일한 산출물이다.
+- 전부 드롭돼도 정상이다 — 지적할 게 없으면 빈 리스트(+`_summary`)로 둔다. 스크립트는 `APPROVE`로 판정하되 **자기 PR을 자동 승인하지 않도록** 게시는 생략하고 콘솔에만 출력한다.
+- 억지로 개수를 채우지 않는다. 확신하는 것만 남긴다.
 
 ---
 
-## Step 6. 결과 출력 / GitHub PR Review 게시
+## Step 7. 게시 / dry-run  ← 스크립트가 전부 처리
 
-**dry-run이면 6-1~6-4를 건너뛰고 콘솔 출력(6-5)만 수행한다.**
-
-### 6-1. position 매핑
-
-```python
-for issue in issues:
-    key = (issue["path"], issue["new_lineno"])
-    pos = mapping.get(key)
-    if pos is None:
-        file_positions = sorted(p for (f, _), p in mapping.items() if f == issue["path"])
-        pos = file_positions[0] if file_positions else 1
-    issue["position"] = pos
-```
-
-### 6-2. 리뷰 이벤트 결정
-
-| 조건 | event |
-|------|-------|
-| HIGH 이슈 존재 | `REQUEST_CHANGES` |
-| MEDIUM 이하만 | `COMMENT` |
-| 이슈 없음 | `APPROVE` |
-
-### 6-3. 전체 리뷰 요약 (body)
-
-```markdown
-## Code Review
-
-(PR 한 줄 요약). 아래 이슈를 인라인 코멘트로 표시했다.
-
-| 심각도 | 건수 |
-|--------|------|
-| HIGH   | N    |
-| MEDIUM | N    |
-| LOW    | N    |
-
-(HIGH 있으면) **머지 전 HIGH 이슈 해결 필요.**
-(없으면) **Approve with comments.**
-
-*분석 범위: 로컬 소스코드 직접 검수 + call site 역추적 + 기존 리뷰 반응 반영.*
-```
-
-### 6-4. API 호출
-
-#### A. 배치 리뷰 (단일 줄 코멘트만 — `position` 기반)
-
-```python
-import json, subprocess, tempfile, os
-
-def post_review(repo, pr_number, summary_body, event, issues):
-    comments = [
-        {"path": i["path"], "position": i["position"], "body": i["body"]}
-        for i in issues
-    ]
-    payload = {"body": summary_body, "event": event, "comments": comments}
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-        json.dump(payload, f)
-        tmp = f.name
-    try:
-        r = subprocess.run(
-            ["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews",
-             "--method", "POST", "--input", tmp],
-            capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            print(f"ERROR: {r.stderr}")
-        else:
-            review = json.loads(r.stdout)
-            print(f"Posted: {review.get('html_url')}")
-    finally:
-        os.unlink(tmp)
-```
-
-#### B. 단일 코멘트 (여러 줄 선택 suggestion — `start_line`/`line` 기반)
-
-여러 줄을 커버하는 suggestion은 reviews 배치 API가 지원하지 않는다.
-`/pulls/{pr}/comments` 엔드포인트를 직접 호출해야 한다.
+findings를 파일로 저장한 뒤:
 
 ```bash
-HEAD_SHA=$(gh pr view <PR_NUMBER> --repo <OWNER/REPO> \
-  --json commits --jq '.commits[-1].oid')
+# dry-run (콘솔만, 게시 안 함)
+python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json --dry-run
 
-# Case A — 동일 사이드 (RIGHT→RIGHT): 추가된 줄끼리 범위
-gh api repos/<OWNER/REPO>/pulls/<PR_NUMBER>/comments \
-  --method POST \
-  --field commit_id="$HEAD_SHA" \
-  --field path='path/to/file.py' \
-  --field start_line=<new_file_시작줄> \
-  --field start_side='RIGHT' \
-  --field line=<new_file_끝줄> \
-  --field side='RIGHT' \
-  --field body='...(suggestion 포함 본문)...' \
-  --jq '.html_url'
-
-# Case B — 크로스사이드 (LEFT→RIGHT): 삭제 줄에서 추가 줄까지
-gh api repos/<OWNER/REPO>/pulls/<PR_NUMBER>/comments \
-  --method POST \
-  --field commit_id="$HEAD_SHA" \
-  --field path='path/to/file.py' \
-  --field start_line=<old_file_시작줄> \
-  --field start_side='LEFT' \
-  --field line=<new_file_끝줄> \
-  --field side='RIGHT' \
-  --field body='...(suggestion 포함 본문)...' \
-  --jq '.html_url'
+# 실제 게시
+python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json
 ```
 
-- **Case A** `start_side=RIGHT, side=RIGHT`: 둘 다 new file 기준 줄 번호. suggestion 줄 수 = `line - start_line + 1` 이어야 함.
-- **Case B** `start_side=LEFT, side=RIGHT`: start는 old file 기준, end는 new file 기준. 줄 번호 체계가 달라 줄 수 공식 불적용. suggestion은 해당 diff 블록 전체를 교체.
-- suggestion 본문에는 Case A의 경우 `start_line`~`line` 범위의 **모든 줄**을 포함해야 Apply가 정상 동작
+스크립트가 하는 일 (모델은 관여하지 않음):
+- diff를 파싱해 각 finding의 `line/side/start_line`을 **검증** → diff 밖이면 **±10줄 이내만** 최근접 줄로 스냅, 그보다 멀면 skip (어디에 달지는 모델의 판단이므로 스크립트가 임의 이동하지 않는다 — skip 사유를 보고 모델이 재앵커).
+- 심각도 SVG 배지(Gemini식 `![HIGH](...gstatic...)`) + `**[SEV] category** — title` 접두어와 ` ```suggestion ` 펜스를 자동 부착. 리뷰 본문 = 모델의 `_summary` markdown + 스크립트의 심각도 집계표.
+- event 기본 결정: **CRITICAL/HIGH 있으면 REQUEST_CHANGES / MEDIUM·LOW만 COMMENT / 없으면 APPROVE**. 이것도 판단이므로 `--event REQUEST_CHANGES|COMMENT`로 오버라이드 가능(APPROVE는 게시 자체가 불가 — self-approve 방지).
+- **line 기반 단일 배치**로 `/pulls/{pr}/reviews`에 1회 게시 (position 안 씀).
+- 배치 실패 시 **개별 코멘트 폴백** — 앵커 하나가 깨져도 나머지는 살린다.
+- 앵커 가능한 코멘트가 하나도 없어도: findings가 있었으면 **요약 리뷰만 게시**(verdict 보존), 정말 이슈가 없으면(APPROVE) **게시 생략·콘솔만**(자기 PR 자동승인 불가).
+- dry-run·게시 모두 콘솔에 이슈 목록·skip·좌표 보정 경고(들여쓰기 불일치 포함)를 출력.
 
-### 6-5. 422 오류 처리
-
-`"Pull request review thread line must be part of the diff"` 발생 시:
-해당 이슈의 position을 파일 내 첫 번째 diff position으로 교체한 뒤 재시도.
+게시 후 스크립트가 출력한 리뷰 URL을 사용자에게 전달한다.
 
 ---
 
-### 6-5. 콘솔 출력
+## 요약 흐름
 
-dry-run 여부에 관계없이 항상 출력한다.
-
-**dry-run 모드:**
 ```
-[dry-run] PR #<번호> 리뷰 결과 (GitHub에 게시하지 않음)
-- 이벤트 예정: REQUEST_CHANGES | COMMENT | APPROVE
-- 이슈: N개 / 기존 리뷰로 skip: N개
-
-이슈 목록:
-  [HIGH]   src/app/core/worker.py:196  pos=52  — UUID object silently dropped
-  [MEDIUM] src/app/data/api.py:521     pos=80  — workspace UUID None bypass
-  [LOW]    src/app/data/schemas.py:12  pos=16  — result type too narrow
-  skip     src/app/core/worker.py:205          — TTL fallback (이미 처리됨)
-
-각 이슈의 본문은 아래에 순서대로 출력한다.
+setup_check → 가이드 로드 → (기존 리뷰 읽기) → diff 수집
+   → sweep.py(HITS/MANUAL 후보 + UNITS 읽기 바닥선) → 소스 정밀 분석 → findings 초안
+   → ★검증 게이트(false-positive 제거)★ → 최종 findings.json
+   → review_post.py --dry-run 로 검증 → 이상 없으면 게시
 ```
 
-**게시 모드:**
-```
-PR #<번호> 리뷰 게시 완료
-- 인라인 코멘트: N개 / 기존 리뷰로 skip: N개
-- 이벤트: REQUEST_CHANGES | COMMENT | APPROVE
-- URL: https://github.com/OWNER/REPO/pull/N#pullrequestreview-XXXXX
-
-이슈 요약:
-  [HIGH]   src/app/core/worker.py:196  — UUID object silently dropped
-  [MEDIUM] src/app/data/api.py:521     — workspace UUID None bypass
-  [LOW]    src/app/data/schemas.py:12  — result type too narrow
-  skip     src/app/core/worker.py:205  — TTL fallback (이미 처리됨)
-```
+두 축의 분업: **발견(discovery)** = `sweep.py`가 결함 범주 전수 + 읽을 루틴 열거로 커버리지를 강제하고, **게시(posting)** = `review_post.py`가 좌표·suggestion·API·event를 결정적으로 처리한다. 모델은 그 사이에서 **판단**(findings.json)만 만든다.

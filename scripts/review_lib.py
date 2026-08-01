@@ -1,0 +1,333 @@
+"""
+review_lib — deterministic core for pr-inline-review.
+
+The whole point of this module: keep every error-prone, mechanical part of
+posting a GitHub inline review OUT of the LLM prompt and IN tested code.
+
+Responsibilities (all pure functions, no network, no file I/O):
+  1. parse_diff()            unified diff -> per-file line/side maps
+  2. resolve_anchor()        a finding -> validated (start_line/start_side/line/side)
+  3. build_comment_body()    a finding -> final markdown (severity prefix + ```suggestion)
+  4. build_review_payload()  findings + diff -> GitHub reviews API payload (+ skipped)
+
+The GitHub "Create a review" API accepts line-based coordinates
+(path, line, side, start_line, start_side) inside comments[], so a single
+batch call covers single-line, multi-line, and cross-side suggestions.
+No `position` arithmetic anywhere — that was the old failure source.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# --------------------------------------------------------------------------- #
+# diff model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Line:
+    """One commentable line in a diff."""
+    kind: str          # "add" | "del" | "ctx"
+    text: str          # line content without the +/-/space marker
+    hunk: int          # hunk index within the file (0-based)
+    old_no: Optional[int]  # line number in the old file (del/ctx)
+    new_no: Optional[int]  # line number in the new file (add/ctx)
+
+
+@dataclass
+class FileDiff:
+    path: str
+    lines: list = field(default_factory=list)          # list[Line]
+    right: dict = field(default_factory=dict)          # new_no -> Line (add|ctx)
+    left: dict = field(default_factory=dict)           # old_no -> Line (del|ctx)
+
+    def right_hunk(self, new_no: int) -> Optional[int]:
+        ln = self.right.get(new_no)
+        return ln.hunk if ln else None
+
+    def left_hunk(self, old_no: int) -> Optional[int]:
+        ln = self.left.get(old_no)
+        return ln.hunk if ln else None
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_diff(diff_text: str) -> dict:
+    """Parse a unified diff (e.g. `gh pr diff`) into {path: FileDiff}."""
+    files: dict = {}
+    cur: Optional[FileDiff] = None
+    hunk = -1
+    old_no = new_no = 0
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git"):
+            cur = None
+            hunk = -1
+        elif raw.startswith("+++ b/"):
+            path = raw[6:].strip()
+            cur = files.get(path) or FileDiff(path=path)
+            files[path] = cur
+            hunk = -1
+        elif raw.startswith("+++ ") or raw.startswith("--- "):
+            # /dev/null or old-file header; ignore
+            continue
+        elif raw.startswith("@@"):
+            m = _HUNK_RE.match(raw)
+            if not m or cur is None:
+                continue
+            hunk += 1
+            old_no = int(m.group(1))
+            new_no = int(m.group(3))
+        elif cur is not None and hunk >= 0 and raw[:1] in ("+", "-", " "):
+            marker, body = raw[:1], raw[1:]
+            if marker == "+":
+                ln = Line("add", body, hunk, None, new_no)
+                cur.lines.append(ln)
+                cur.right[new_no] = ln
+                new_no += 1
+            elif marker == "-":
+                ln = Line("del", body, hunk, old_no, None)
+                cur.lines.append(ln)
+                cur.left[old_no] = ln
+                old_no += 1
+            else:  # context
+                ln = Line("ctx", body, hunk, old_no, new_no)
+                cur.lines.append(ln)
+                cur.right[new_no] = ln
+                cur.left[old_no] = ln
+                old_no += 1
+                new_no += 1
+    return files
+
+
+# --------------------------------------------------------------------------- #
+# anchor resolution  (the part that used to be LLM mental math)
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Anchor:
+    path: str
+    line: int
+    side: str                       # "RIGHT" | "LEFT"
+    start_line: Optional[int] = None
+    start_side: Optional[str] = None
+    warnings: list = field(default_factory=list)
+    valid: bool = True
+
+    def to_comment_fields(self) -> dict:
+        d = {"path": self.path, "line": self.line, "side": self.side}
+        if self.start_line is not None:
+            d["start_line"] = self.start_line
+            d["start_side"] = self.start_side or self.side
+        return d
+
+
+def _leading_ws(s: str) -> str:
+    return s[: len(s) - len(s.lstrip(" \t"))]
+
+
+# Beyond this distance a snapped comment lands somewhere the model never looked
+# at — that is a wrong location, not a delivery. Placement is the model's
+# judgement; the script only corrects near-misses and rejects the rest.
+MAX_SNAP_DISTANCE = 10
+
+
+def resolve_anchor(fd: FileDiff, finding: dict) -> Anchor:
+    """
+    Turn a finding's requested location into validated GitHub coordinates.
+
+    finding keys used:
+      path (str, required)
+      line (int, required)  -- primary anchor, new-file line number by default
+      side (str, optional)  -- "RIGHT" (default) | "LEFT"
+      start_line (int, optional)  -- for multi-line ranges
+      start_side (str, optional)
+
+    Guarantees the returned Anchor is part of the diff (or marks it invalid),
+    which is what prevents the 422 "line must be part of the diff" failures.
+    """
+    path = finding["path"]
+    side = (finding.get("side") or "RIGHT").upper()
+    line = int(finding["line"])
+    warnings: list = []
+
+    if side == "RIGHT":
+        pool, hunk_of = fd.right, fd.right_hunk
+    else:
+        pool, hunk_of = fd.left, fd.left_hunk
+
+    if line not in pool:
+        # Anchor not directly commentable. Correct near-misses by snapping to
+        # the nearest commentable line; anything farther is a mislocated
+        # finding, so reject it and let the model re-anchor.
+        candidates = sorted(pool)
+        if not candidates:
+            return Anchor(path, line, side, warnings=[
+                f"{path}: no commentable {side} lines in diff"], valid=False)
+        nearest = min(candidates, key=lambda x: abs(x - line))
+        if abs(nearest - line) > MAX_SNAP_DISTANCE:
+            return Anchor(path, line, side, warnings=[
+                f"{path}:{line} not in diff on {side}; nearest commentable "
+                f"line {nearest} is >{MAX_SNAP_DISTANCE} lines away — "
+                "re-anchor the finding"], valid=False)
+        warnings.append(
+            f"{path}:{line} not in diff on {side}; snapped to {nearest}")
+        line = nearest
+
+    anchor = Anchor(path, line, side, warnings=warnings)
+
+    # optional multi-line range
+    if finding.get("start_line") is not None:
+        start_line = int(finding["start_line"])
+        start_side = (finding.get("start_side") or side).upper()
+        s_pool = fd.right if start_side == "RIGHT" else fd.left
+        if start_line not in s_pool:
+            warnings.append(
+                f"{path}: start_line {start_line} not in diff on {start_side}; "
+                "dropping range, using single-line anchor")
+        elif start_side == side and start_line > line:
+            warnings.append(
+                f"{path}: start_line {start_line} > line {line}; dropping range")
+        elif start_side == side and hunk_of(start_line) != hunk_of(line):
+            warnings.append(
+                f"{path}: range {start_line}-{line} spans multiple hunks; "
+                "dropping range")
+        else:
+            anchor.start_line = start_line
+            anchor.start_side = start_side
+
+    return anchor
+
+
+# --------------------------------------------------------------------------- #
+# body + suggestion formatting  (model never writes ```suggestion itself)
+# --------------------------------------------------------------------------- #
+
+_SEV = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+
+# Gemini-style severity badges (same visual convention as the cloud review bots).
+_BADGE = {
+    "CRITICAL": "![CRITICAL](https://www.gstatic.com/codereviewagent/critical.svg)",
+    "HIGH": "![HIGH](https://www.gstatic.com/codereviewagent/high-priority.svg)",
+    "MEDIUM": "![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg)",
+    "LOW": "![LOW](https://www.gstatic.com/codereviewagent/low-priority.svg)",
+}
+
+
+def build_comment_body(finding: dict, fd: Optional[FileDiff] = None,
+                       anchor: Optional[Anchor] = None) -> str:
+    """
+    Assemble the final comment markdown from structured fields.
+
+    finding keys:
+      severity (str)      CRITICAL | HIGH | MEDIUM | LOW
+      category (str)      security | bug | regression | lifecycle |
+                          type-safety | extensibility | pattern | style
+      title (str)
+      explanation (str)   markdown; NO suggestion fence
+      suggestion (list[str], optional)  replacement lines; wrapped here
+    """
+    sev = str(finding.get("severity", "MEDIUM")).upper()
+    if sev not in _SEV:
+        sev = "MEDIUM"
+    cat = finding.get("category", "bug")
+    title = finding.get("title", "").strip()
+    header = f"{_BADGE[sev]} **[{sev}] {cat}** — {title}"
+
+    parts = [header]
+    explanation = (finding.get("explanation") or "").strip()
+    if explanation:
+        parts.append(explanation)
+
+    sugg = finding.get("suggestion")
+    if sugg:
+        lines = sugg.splitlines() if isinstance(sugg, str) else list(sugg)
+        if anchor is not None and anchor.side == "LEFT":
+            # a LEFT-anchored line no longer exists in the new file, so GitHub
+            # renders the fence but the Apply button can never work
+            anchor.warnings.append(
+                f"{anchor.path}:{anchor.line} suggestion anchored on LEFT (deleted "
+                "line) — not applyable; describe the fix in explanation instead")
+        if (anchor is not None and anchor.start_line is not None
+                and anchor.start_side == "RIGHT" and anchor.side == "RIGHT"):
+            span = anchor.line - anchor.start_line + 1
+            if len(lines) < span:
+                # Apply replaces the WHOLE range with the suggestion; a shorter
+                # suggestion silently deletes the unmentioned lines unless the
+                # shrink is intentional
+                anchor.warnings.append(
+                    f"{anchor.path}:{anchor.start_line}-{anchor.line} range spans "
+                    f"{span} lines but suggestion has {len(lines)} — kept lines "
+                    "must be included unless deletion is intended")
+        # indentation sanity check against the anchored line in the diff
+        if fd is not None and anchor is not None and anchor.side == "RIGHT":
+            target = fd.right.get(anchor.start_line or anchor.line)
+            if target and lines:
+                want, got = _leading_ws(target.text), _leading_ws(lines[0])
+                if want != got and anchor is not None:
+                    # Surface to the console (anchor.warnings), NOT into the posted
+                    # comment body — do not silently rewrite. Apply button breaks on
+                    # indent mismatch, so the model/caller should fix the suggestion.
+                    anchor.warnings.append(
+                        f"{anchor.path}:{anchor.start_line or anchor.line} suggestion "
+                        f"indent mismatch (target {len(want)} ws, first line {len(got)} ws)")
+        block = "```suggestion\n" + "\n".join(lines) + "\n```"
+        parts.append(block)
+
+    return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------- #
+# payload assembly
+# --------------------------------------------------------------------------- #
+
+def decide_event(findings: list) -> str:
+    """Default event policy; callers may override (e.g. review_post --event)."""
+    if any(str(f.get("severity", "")).upper() in ("CRITICAL", "HIGH") for f in findings):
+        return "REQUEST_CHANGES"
+    if findings:
+        return "COMMENT"
+    return "APPROVE"
+
+
+def build_review_payload(findings: list, diffmap: dict, summary_body: str,
+                         event: Optional[str] = None) -> tuple:
+    """
+    Returns (payload_dict, skipped_list).
+
+    payload_dict is ready for POST /repos/{repo}/pulls/{n}/reviews.
+    skipped_list holds findings that could not be anchored, with reasons —
+    these are reported to the console, never silently dropped.
+    """
+    comments = []
+    skipped = []
+    all_warnings = []
+
+    for f in findings:
+        fd = diffmap.get(f["path"])
+        if fd is None:
+            skipped.append({**f, "_reason": f"{f['path']} not in diff"})
+            continue
+        anchor = resolve_anchor(fd, f)
+        if not anchor.valid:
+            all_warnings.extend(anchor.warnings)
+            skipped.append({**f, "_reason": "; ".join(anchor.warnings)})
+            continue
+        # build_comment_body may append an indent warning to anchor.warnings,
+        # so collect warnings AFTER it runs (and keep them out of the posted body).
+        body = build_comment_body(f, fd, anchor)
+        all_warnings.extend(anchor.warnings)
+        comments.append({**anchor.to_comment_fields(), "body": body})
+
+    # Event reflects the full verdict: a CRITICAL/HIGH still requests changes even
+    # if its inline anchor was skipped (it is surfaced in the summary + console).
+    payload = {
+        "body": summary_body,
+        "event": event or decide_event(findings),
+        "comments": comments,
+    }
+    return payload, skipped, all_warnings
