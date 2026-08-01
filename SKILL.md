@@ -200,6 +200,41 @@ gh api repos/<OWNER/REPO>/contents/<path>?ref=<PR_HEAD> \
 
 > **주의:** 브랜치 불일치 시 `git diff --name-only $MERGE_BASE HEAD`는 현재 체크아웃 브랜치 기준이라 사용 금지. 파일 목록은 Step 2에서 얻은 diff에서 추출한다.
 
+### 3-A. 기계적 sink 스윕 (내장 sweep.py)
+
+수동 grep(3-3) 전에 **이 스킬에 내장된 `scripts/sweep.py`**를 한 번 돌려 후보 결함 위치를 기계적으로 수집한다. Python·Shell·TypeScript를 파일 확장자로 자동 디스패치하므로 언어별 grep을 직접 짜지 않아도 된다. 출력의 `== HITS ==`/`== MANUAL ==`을 **Step 4 이슈 후보의 출발점**으로 삼는다.
+
+> **자체 완결.** `sweep.py`와 규칙 파일 `patterns.toml`이 `scripts/`에 함께 들어있어 `code-review-sweep` 등 다른 스킬 없이 독립 동작한다(`sweep.py`가 옆의 `patterns.toml`을 로드). 남는 의존성은 스킬이 아니라 **프로젝트 env**뿐 — ruff(Python 린트)와 tree-sitter(TS UNITS)는 `uv run`으로 프로젝트 환경에서 해석된다. 아래 명령의 `$SKILL_DIR`는 **이 SKILL.md가 있는 디렉토리의 절대경로**로, cwd가 바뀌어도 스크립트를 찾게 한다.
+
+`sweep.py`는 diff 범위(추가된 줄)만 스캔하되 **파일 본문을 디스크에서 읽고**(regex/AST), ruff/eslint 린터는 실제 파일에 실행한다. 따라서 리뷰 대상 트리가 디스크에 존재해야 한다. 3-0에서 정한 전략에 따라 갈린다.
+
+**same-branch:** 현재 워킹트리가 곧 PR head이므로 그대로 실행한다.
+
+```bash
+SKILL_DIR=<이 스킬 디렉토리의 절대경로>
+uv run python "$SKILL_DIR/scripts/sweep.py" --base origin/develop
+# eslint는 로컬 node_modules가 있을 때만 자동 실행됨 (없으면 조용히 skip)
+```
+
+**different-branch:** 현재 브랜치를 보존한 채 PR head를 **별도 worktree로 materialize**한 뒤 그 안에서 실행한다. 체크아웃(브랜치 전환)이 아니라 detached worktree라 원본 디렉토리·현재 브랜치·스테이징에 영향이 없다.
+
+```bash
+git fetch origin <PR_HEAD> -q
+WT=$(mktemp -d)/pr-<PR_NUMBER>
+git worktree add --detach "$WT" FETCH_HEAD -q
+
+MB=$(git merge-base origin/develop FETCH_HEAD)
+( cd "$WT" && uv run python "$SKILL_DIR/scripts/sweep.py" --base "$MB" )
+
+git worktree remove "$WT" --force   # 스윕 후 즉시 정리
+```
+
+**린터 정책:** worktree에는 `node_modules`가 없으므로 eslint 레인은 **기본적으로 skip**된다(regex 5종·AST·dead-code·ruff는 정상 동작). eslint까지 강제로 돌리려면 원본의 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 다만 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고, TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: AxFlow `pr-code-review`)에 맡긴다.
+
+**`== UNITS ==` 소비 (스윕의 핵심 이득).** HITS는 패턴이 아는 결함만 잡지만, `== UNITS ==`는 diff가 건드린 **모든 루틴**(Python=stdlib `ast`, TypeScript/TSX=tree-sitter)을 열거한다 — 이게 "무엇을 읽을 것인가"의 바닥선이고, 패턴이 침묵한 의도(intent) 버그에 닿는 통로다. 각 UNIT을 `Read(file, offset, limit)`로 지정 범위만큼 읽는다: `func`는 함수 통째(데코레이터 포함), `block`은 hunk 감싸는 블록만(+`oversized-fn` 플래그는 그 자체가 finding 후보), `module`은 모듈 레벨 변경. `callees`/`callers`는 **한 홉 확장** 대상 — HIT나 타입 경계가 필요를 만들 때만 그 본문을 추가로 읽고, 그래프를 더 따라가지 않는다. Step 4에서 **모든 UNIT에 finding 또는 "read, clean" 한 줄**을 남긴다. (worktree에서 실행할 때 tree-sitter가 프로젝트 env에 있어야 TS UNITS가 나온다 — worktree는 같은 프로젝트라 `cd $WT && uv run`이면 해결. 없으면 `# WARNING: TS units skipped`가 뜨고 Python UNITS만 나온다.)
+
+> **주의:** `sweep.py`는 discovery만 담당한다. 게시용 diff position 매핑(Step 2·6)은 별개이며 이 스윕이 좌표를 주지 않는다. HITS/UNITS는 후보·읽기대상일 뿐이므로 Step 4의 검증(false positive 제거)을 반드시 거친다.
+
 ### 3-1. 변경 파일 목록 확인
 
 **same-branch인 경우:**
@@ -312,7 +347,7 @@ diff의 `+` 줄에 집중. `-` 줄은 리포트하지 않는다. **근거 없는
 ### 형식
 
 ```markdown
-**[HIGH] type-safety** — UUID object silently dropped by `isinstance(value, str)`
+![high](https://www.gstatic.com/codereviewagent/high-priority.svg) **[HIGH] type-safety** — UUID object silently dropped by `isinstance(value, str)`
 
 `task.kwargs`의 `team_uuid`가 `uuid.UUID` 객체로 들어오면 `isinstance(value, str)` 필터에서
 탈락해 Redis metadata에 저장되지 않는다. 이후 `get_task()`는 해당 UUID를 phantom으로 판단해
@@ -464,6 +499,23 @@ After:
 - `**[HIGH] type-safety**` — 타입 불일치로 인한 silent failure
 - `**[MEDIUM] bug**` / `**[MEDIUM] lifecycle**` / `**[MEDIUM] extensibility**`
 - `**[LOW] pattern**` / `**[LOW] style**`
+
+### 심각도 배지 아이콘
+
+코멘트 본문 첫 줄의 심각도 접두어 앞에 배지 SVG를 붙인다 (Gemini code review와 동일한 시각 규약):
+
+| 심각도 | 배지 마크다운 |
+|--------|--------------|
+| CRITICAL | `![CRITICAL](https://www.gstatic.com/codereviewagent/critical.svg)` |
+| HIGH | `![HIGH](https://www.gstatic.com/codereviewagent/high-priority.svg)` |
+| MEDIUM | `![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg)` |
+| LOW | `![LOW](https://www.gstatic.com/codereviewagent/low-priority.svg)` |
+
+적용 예 (본문 첫 줄):
+
+```markdown
+![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg) **[MEDIUM] bug** — 제목
+```
 
 ---
 

@@ -1,0 +1,145 @@
+# Sink-sweep patterns, grouped per language. sweep.py loads this file and
+# dispatches scanners by file extension. Regexes use TOML *literal* strings
+# ('...') so backslashes are taken verbatim (no double-escaping).
+#
+# Per-language keys:
+#   extensions       list of file suffixes that select this language
+#   match_shebang    also match extensionless files whose shebang is sh/bash
+#   special_scanners named code hooks in sweep.py (AST checks config can't express)
+#   [[<lang>.patterns]]  {category, regex, exclude?}  scanned on ADDED lines only
+#   [<lang>.linter]      {command, parser, runner?, code_map}  external linter lane
+#   [<lang>.dead_code]   {def_regex, grep_glob, skip_names?}   added defs w/ 0 external refs
+
+[global]
+# Review-unit sizing (Python == UNITS ==). A changed function <= size_threshold is read
+# whole; a larger one touched only sparsely is read as the hunk's enclosing block, unless
+# the diff covers >= coverage_promote of it (then promoted back to a whole read).
+unit_size_threshold = 120
+unit_coverage_promote = 0.4
+unit_max_blocks = 3
+unit_callers_max = 5
+
+# Reference resolution for DEAD-CODE and unit callers (Python only). When jedi is
+# importable, it replaces the git-grep name search with type-aware references: it
+# follows import aliases (`import foo as bar`) and excludes same-named symbols
+# defined in other modules — the two blind spots that make a lexical grep both
+# over- and under-count references. Scoped to `jedi_roots` for speed: a narrow
+# root avoids walking the repo's untracked tree (measured ~10x faster than rooting
+# at the repo). Any per-symbol failure, a def outside the roots, or an exhausted
+# `jedi_max_symbols` budget falls back to git grep for that symbol; a missing jedi
+# install falls back wholesale with a WARNING line. Set jedi_enabled = false to
+# force git grep everywhere.
+jedi_enabled = true
+jedi_roots = ["src"]
+jedi_sys_path = ["src"]
+jedi_max_symbols = 60
+
+manual_categories = [
+  "GRACEFUL-DEGRADATION",
+  "NULL-TYPE-SAFETY",
+  "CONCURRENCY-ATOMICITY",
+  "RESOURCE-HELD-ACROSS-IO",
+  "API-TYPE-CORRECTNESS",
+  "MERGE-KEY-COLLISION",
+]
+
+# --------------------------------------------------------------------------- py
+[py]
+extensions = [".py"]
+special_scanners = ["loop_isolation"]
+
+[[py.patterns]]
+category = "SSRF-OUTBOUND"
+regex = '\b(httpx|requests|aiohttp|urllib\.request|socket\.(socket|create_connection))\b|\bclient\.(get|post|put|patch|delete|request|stream)\('
+
+[[py.patterns]]
+category = "LIFECYCLE-CREATE"
+regex = '\b\w*(create|insert|register|acquire|upload)\w*\(|\b(store|put)_\w+\('
+
+[[py.patterns]]
+category = "WRITE-AUTH"
+regex = '\b(db|session)\.(add|delete|merge)\b|\b(update|delete|remove)_\w+\('
+
+[py.linter]
+command = ["ruff", "check", "--select", "ASYNC,S", "--output-format", "concise", "--no-fix"]
+parser = "regex-line"
+runner = "uv"
+[py.linter.code_map]
+ASYNC = "EVENT-LOOP-BLOCKING"
+S = "BOUNDARY-VALIDATION"
+
+[py.dead_code]
+def_regex = '^\+\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)'
+grep_glob = "*.py"
+skip_names = '^__\w+__$|^test_'
+
+# --------------------------------------------------------------------------- sh
+[sh]
+extensions = [".sh", ".bash"]
+match_shebang = true
+
+[[sh.patterns]]
+category = "SH-OUTBOUND"
+regex = '\b(curl|wget|nc|ncat)\b'
+
+[[sh.patterns]]
+category = "SH-INJECTION"
+regex = '\beval\b|\b(bash|sh)\s+-c\b'
+
+[[sh.patterns]]
+category = "SH-UNSAFE-RM"
+regex = '\brm\s+(-\w+\s+)*[^|;&]*\$'
+
+[[sh.patterns]]
+category = "SH-TEMPFILE"
+regex = '/tmp/\w'
+
+# --------------------------------------------------------------------------- ts
+[ts]
+extensions = [".ts", ".tsx"]
+# Skip comment-only lines so prose ("renders as a chip", "counts as loading") does not
+# trip the word-based patterns below.
+skip_lines = '^\s*(?://|\*|/\*)'
+
+[[ts.patterns]]
+category = "UNSAFE-CAST"
+# `as X` type assertion, excluding the only sanctioned form `as const`.
+regex = '\bas\s+(?!const\b)[A-Za-z{[]'
+exclude = '^\s*(?:import|export)\b'
+
+[[ts.patterns]]
+category = "ANY-ESCAPE"
+regex = ':\s*any\b|<any>|\bas\s+any\b|\bany\[\]'
+
+[[ts.patterns]]
+category = "NON-NULL-ASSERT"
+# foo!.bar / foo()! — the `!` non-null assertion swallows a real null at runtime.
+regex = '[\w\)\]]![.\)\];,]'
+
+[[ts.patterns]]
+category = "TS-SUPPRESS"
+regex = '@ts-ignore\b|@ts-nocheck\b'
+
+[[ts.patterns]]
+category = "DANGER-HTML"
+regex = 'dangerouslySetInnerHTML'
+
+[ts.linter]
+command = ["pnpm", "exec", "eslint", "--format", "json"]
+parser = "eslint-json"
+# eslint needs the tree's node_modules (plugins/parser/tsconfig). Run it only when
+# that is present locally, or when forced with --linter. A worktree checkout of a
+# remote PR has no node_modules, so the eslint lane is skipped there by default.
+local_only = true
+local_bin = "node_modules/.bin/eslint"
+[ts.linter.code_map]
+"@typescript-eslint/no-floating-promises" = "UNAWAITED-PROMISE"
+"@typescript-eslint/no-misused-promises" = "MISUSED-PROMISE"
+"@typescript-eslint/no-explicit-any" = "ANY-ESCAPE"
+"react-hooks/exhaustive-deps" = "EFFECT-DEPS"
+"react-hooks/rules-of-hooks" = "HOOK-RULES"
+"jsx-a11y/" = "A11Y"
+
+[ts.dead_code]
+def_regex = '^\+\s*export\s+(?:async\s+)?(?:const|function|class)\s+([A-Za-z_]\w*)'
+grep_glob = "*.ts*"
