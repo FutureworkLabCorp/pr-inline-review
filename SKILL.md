@@ -204,6 +204,7 @@ git worktree remove "$WT" --force
 - **side 선택:** `+`/컨텍스트 줄만이면 RIGHT(기본). `-`줄만 있는 위치에는 suggestion 불가(이미 삭제된 줄 — `explanation`으로 서술, 스크립트가 경고). `-`/`+` 혼합 블록 전체 교체는 `start_side: "LEFT"`(old 줄 번호) + `side: "RIGHT"`(new 줄 번호)로 가능.
 - suggestion 각 줄의 **들여쓰기는 실제 파일과 정확히 일치**시킨다 (스크립트가 첫 줄 들여쓰기 불일치를 경고로 잡아준다).
 - 설계 변경이 필요해 one-click suggestion이 불가능하면 `suggestion`을 빼고 `explanation`에 방향만 서술.
+- **위키 인용은 `[[Page]]` / `[[라벨|Page]]` 로 쓴다.** GitHub 은 이 문법을 위키 안에서만 해석해서 PR 코멘트에는 그냥 글자로 남는데, `review_post.py` 가 게시 전에 `https://github.com/OWNER/REPO/wiki/Page` 로 펴 준다. `#앵커`도 따라간다. 코드 펜스와 인라인 코드 안은 건드리지 않으니 이 문법 자체를 설명할 때도 안전하다. 로컬에 `wiki/` 클론이 있으면 없는 페이지를 경고로 알려준다(링크는 그대로 붙는다).
 - `category`: security | bug | regression | lifecycle | type-safety | extensibility | pattern | style
 
 > diff **밖** 줄을 고쳐야 하면 suggestion 대신 `explanation`에 `Before/After` 코드블록으로 안내한다 (해당 줄은 인라인 앵커가 불가하므로).
@@ -243,11 +244,12 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json
 
 스크립트가 하는 일 (모델은 관여하지 않음):
 - diff를 파싱해 각 finding의 `line/side/start_line`을 **검증** → diff 밖이면 **±10줄 이내만** 최근접 줄로 스냅, 그보다 멀면 skip (어디에 달지는 모델의 판단이므로 스크립트가 임의 이동하지 않는다 — skip 사유를 보고 모델이 재앵커).
+- `_summary`·`title`·`explanation` 의 `[[Page]]` 를 위키 URL 로 변환(`--no-wiki-links` 로 끄고, 위키가 딴 데 있으면 `--wiki-base`).
 - 심각도 SVG 배지(Gemini식 `![HIGH](...gstatic...)`) + `**[SEV] category** — title` 접두어와 ` ```suggestion ` 펜스를 자동 부착. 리뷰 본문 = 모델의 `_summary` markdown + 스크립트의 심각도 집계표.
 - event 기본 결정: **CRITICAL/HIGH 있으면 REQUEST_CHANGES / MEDIUM·LOW만 COMMENT / 없으면 APPROVE**. 이것도 판단이므로 `--event REQUEST_CHANGES|COMMENT`로 오버라이드 가능(APPROVE는 게시 자체가 불가 — self-approve 방지).
 - **line 기반 단일 배치**로 `/pulls/{pr}/reviews`에 1회 게시 (position 안 씀).
 - 배치 실패 시 **개별 코멘트 폴백** — 앵커 하나가 깨져도 나머지는 살린다.
-- 앵커 가능한 코멘트가 하나도 없어도: findings가 있었으면 **요약 리뷰만 게시**(verdict 보존), 정말 이슈가 없으면(APPROVE) **게시 생략·콘솔만**(자기 PR 자동승인 불가).
+- 앵커 가능한 코멘트가 하나도 없어도 **요약 리뷰만 게시**해 verdict를 보존한다 — findings가 전부 skip된 경우든, 지적 없이 `_summary`만 남기는 경우든. 막히는 건 APPROVE 하나뿐이고(자기 PR 자동승인 불가), findings가 없으면 그게 기본 event라 요약만 올리려면 `--event COMMENT`를 명시해야 한다. dry-run도 같은 판정을 출력하므로, 게시될지 여부를 미리 볼 수 있다.
 - dry-run·게시 모두 콘솔에 이슈 목록·skip·좌표 보정 경고(들여쓰기 불일치 포함)를 출력.
 
 게시 후 스크립트가 출력한 리뷰 URL을 사용자에게 전달한다.

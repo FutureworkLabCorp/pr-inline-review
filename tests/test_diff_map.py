@@ -6,10 +6,12 @@ Tests for review_lib. Runnable two ways:
 import os
 import sys
 
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 
 import review_lib as R  # noqa: E402
+
 
 FIXTURE = os.path.join(HERE, "fixtures", "sample.diff")
 with open(FIXTURE, encoding="utf-8") as fh:

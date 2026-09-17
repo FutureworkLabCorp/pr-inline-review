@@ -9,6 +9,8 @@ Responsibilities (all pure functions, no network, no file I/O):
   2. resolve_anchor()        a finding -> validated (start_line/start_side/line/side)
   3. build_comment_body()    a finding -> final markdown (severity prefix + ```suggestion)
   4. build_review_payload()  findings + diff -> GitHub reviews API payload (+ skipped)
+  5. expand_wiki_links()     [[Page]] -> a real wiki URL (GitHub only resolves the
+                             double-bracket form inside a wiki, not in a PR comment)
 
 The GitHub "Create a review" API accepts line-based coordinates
 (path, line, side, start_line, start_side) inside comments[], so a single
@@ -19,6 +21,7 @@ No `position` arithmetic anywhere — that was the old failure source.
 from __future__ import annotations
 
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -216,6 +219,68 @@ _BADGE = {
     "MEDIUM": "![MEDIUM](https://www.gstatic.com/codereviewagent/medium-priority.svg)",
     "LOW": "![LOW](https://www.gstatic.com/codereviewagent/low-priority.svg)",
 }
+
+
+# --------------------------------------------------------------------------- #
+# wiki links
+# --------------------------------------------------------------------------- #
+
+_WIKI_LINK = re.compile(r"\[\[([^\[\]\n|]+)(?:\|([^\[\]\n]+))?\]\]")
+_FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_INLINE_CODE = re.compile(r"(`+[^`]*`+)")
+
+
+def expand_wiki_links(text: str, base_url: str, known_pages: Optional[set] = None,
+                      on_unknown=None) -> str:
+    """Rewrite gollum ``[[Page]]`` / ``[[Label|Page]]`` into ordinary markdown links.
+
+    GitHub resolves the double-bracket form only inside a wiki. In a PR review body or
+    an inline comment it stays literal text, so the reference reads as noise and nobody
+    can follow it. Expanding here lets a finding cite the wiki in the wiki's own syntax
+    and still land as a working link.
+
+    ``base_url`` is the wiki root (``https://github.com/OWNER/REPO/wiki/``). A page name
+    is slugged the way GitHub does it — spaces become hyphens — and a ``#anchor`` is
+    carried through. When ``known_pages`` is given, a link outside it is still expanded
+    (a local clone may simply be stale) but ``on_unknown(page)`` is called so the caller
+    can warn.
+
+    Code fences and inline code spans are left untouched: ``\u0060[[Page]]\u0060`` in prose
+    about this syntax must survive verbatim.
+    """
+    if not text or "[[" not in text:
+        return text
+
+    def _one(m: "re.Match") -> str:
+        label = m.group(1).strip()
+        page = (m.group(2) or m.group(1)).strip()
+        name, _, anchor = page.partition("#")
+        name = name.strip()
+        if not name:
+            return m.group(0)
+        if known_pages is not None and name not in known_pages and on_unknown:
+            on_unknown(name)
+        url = base_url + urllib.parse.quote(name.replace(" ", "-"), safe="-._~/")
+        if anchor:
+            url += "#" + urllib.parse.quote(anchor.strip(), safe="-._~")
+        return f"[{label}]({url})"
+
+    out, fence = [], ""
+    for line in text.split("\n"):
+        m = _FENCE.match(line)
+        if m:
+            tok = m.group(1)[0] * 3
+            fence = "" if fence == tok else (fence or tok)
+            out.append(line)
+            continue
+        if fence:
+            out.append(line)
+            continue
+        # split() with a capturing group alternates prose/code, code at odd indices
+        parts = _INLINE_CODE.split(line)
+        out.append("".join(part if i % 2 else _WIKI_LINK.sub(_one, part)
+                           for i, part in enumerate(parts)))
+    return "\n".join(out)
 
 
 def build_comment_body(finding: dict, fd: Optional[FileDiff] = None,

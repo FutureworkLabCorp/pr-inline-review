@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 
+
 # Windows consoles default to a legacy codepage (e.g. cp949) that cannot encode
 # em-dashes/emoji. Force UTF-8 so output never crashes cross-platform.
 for _s in (sys.stdout, sys.stderr):

@@ -30,6 +30,11 @@ findings.json schema (a list; summary is optional and may be first object with "
       "suggestion": ["replacement", "lines"]   # optional; script wraps in ```suggestion
     }
   ]
+
+`_summary`, `title` and `explanation` may cite the wiki in its own `[[Page]]` /
+`[[Label|Page]]` syntax; GitHub only resolves that inside a wiki, so this script
+rewrites it to https://github.com/OWNER/REPO/wiki/Page before posting (--no-wiki-links
+to keep it literal, --wiki-base for a wiki hosted elsewhere).
 """
 from __future__ import annotations
 
@@ -39,6 +44,7 @@ import os
 import subprocess
 import sys
 import tempfile
+
 
 # Force UTF-8 stdout/stderr so emoji/em-dash never crash on Windows cp949 etc.
 for _s in (sys.stdout, sys.stderr):
@@ -64,12 +70,14 @@ def _run(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
     return p
 
 
-def detect_repo() -> str:
+def detect_repo(required: bool = True):
     p = _run(["gh", "repo", "view", "--json", "nameWithOwner",
               "--jq", ".nameWithOwner"], check=False)
     if p.returncode == 0 and p.stdout.strip():
         return p.stdout.strip()
-    raise SystemExit("Could not detect repo; pass --repo OWNER/REPO.")
+    if required:
+        raise SystemExit("Could not detect repo; pass --repo OWNER/REPO.")
+    return None
 
 
 def fetch_diff(repo: str, pr: int) -> str:
@@ -114,6 +122,35 @@ def post_single_comment(repo: str, pr: int, head_sha: str, c: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# wiki links
+# --------------------------------------------------------------------------- #
+
+def local_wiki_pages(root: str = "wiki"):
+    """Page names of a wiki clone sitting next to the repo, or None if there is none.
+
+    Only used to warn about a link nobody can follow — a missing clone must not turn
+    into "every page is unknown", hence None rather than an empty set.
+    """
+    if not os.path.isdir(root):
+        return None
+    pages = {os.path.splitext(f)[0] for f in os.listdir(root) if f.endswith(".md")}
+    return pages or None
+
+
+def expand_wiki_links_in(findings: list, model_summary: str, base: str,
+                         pages=None) -> tuple:
+    """Expand [[Page]] in every model-authored string. Returns (summary, warnings)."""
+    unknown = set()
+    model_summary = R.expand_wiki_links(model_summary, base, pages, unknown.add)
+    for f in findings:
+        for key in ("title", "explanation"):
+            if f.get(key):
+                f[key] = R.expand_wiki_links(f[key], base, pages, unknown.add)
+    return model_summary, [f"wiki page not in ./wiki: [[{p}]] — link posted anyway"
+                           for p in sorted(unknown)]
+
+
+# --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
 
@@ -141,7 +178,29 @@ def summary_body(findings: list, model_summary: str) -> str:
     return "\n".join(lines)
 
 
-def print_console(payload: dict, skipped: list, warns: list, dry: bool):
+def summary_only_plan(event: str, findings: list, model_summary: str):
+    """What a review with nothing anchored inline will do, as (post?, reason).
+
+    Two callers — the dry run and the real one — so a dry run cannot promise a
+    posting the real run then skips. That mismatch is the whole reason this is a
+    function and not an `if` in each branch.
+
+    APPROVE is the one event that is never posted, which is what stops a self-
+    approval. With no findings it is also the event `decide_event` picks, so a
+    summary-only review takes an explicit `--event COMMENT` and never happens by
+    accident.
+    """
+    if event == "APPROVE":
+        return False, "이슈 없음 — 게시 생략(콘솔만). 요약만 남기려면 --event COMMENT."
+    if findings:
+        return True, f"인라인 앵커 없음(전부 skip) — 요약 리뷰만 게시 (event={event})."
+    if model_summary:
+        return True, f"인라인 없음(요약만) — 요약 리뷰만 게시 (event={event})."
+    return False, "게시할 내용 없음(findings·_summary 둘 다 비어 있음) — 콘솔만."
+
+
+def print_console(payload: dict, skipped: list, warns: list, dry: bool,
+                  wiki_warns: list = ()):
     tag = "[dry-run] " if dry else ""
     print(f"\n{tag}PR 리뷰 — event={payload['event']} "
           f"comments={len(payload['comments'])} skipped={len(skipped)}")
@@ -155,6 +214,10 @@ def print_console(payload: dict, skipped: list, warns: list, dry: bool):
     if warns:
         print("\n  경고(좌표 보정):")
         for w in warns:
+            print(f"    - {w}")
+    if wiki_warns:
+        print("\n  경고(위키 링크):")
+        for w in wiki_warns:
             print(f"    - {w}")
 
 
@@ -183,6 +246,11 @@ def main(argv=None):
     ap.add_argument("--event", choices=["REQUEST_CHANGES", "COMMENT"],
                     help="override the auto-decided event (APPROVE is not "
                          "postable — the tool must never self-approve)")
+    ap.add_argument("--wiki-base",
+                    help="wiki root for [[Page]] expansion "
+                         "(default https://github.com/OWNER/REPO/wiki/)")
+    ap.add_argument("--no-wiki-links", action="store_true",
+                    help="leave [[Page]] literal instead of linking it")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -191,6 +259,19 @@ def main(argv=None):
     # No PR number -> local review, force dry-run (never posts).
     dry = args.dry_run or args.pr is None
     repo = args.repo or (detect_repo() if not dry or args.pr else "LOCAL/LOCAL")
+
+    # Before anything renders a body: [[Page]] is wiki-only syntax and would post as
+    # literal text. A local review has no repo to build the URL from, so fall back to
+    # the checkout's own remote and leave the links alone if even that is unknown.
+    wiki_warns = []
+    if not args.no_wiki_links:
+        base = args.wiki_base
+        if not base:
+            owner = repo if repo != "LOCAL/LOCAL" else detect_repo(required=False)
+            base = f"https://github.com/{owner}/wiki/" if owner else None
+        if base:
+            model_summary, wiki_warns = expand_wiki_links_in(
+                findings, model_summary, base.rstrip("/") + "/", local_wiki_pages())
 
     if args.pr is None:
         sys.stderr.write("no --pr: local dry-run (nothing will be posted)\n")
@@ -201,6 +282,8 @@ def main(argv=None):
         for f in findings:
             print(f"\n  {f.get('path')}:{f.get('line')} "
                   f"[{str(f.get('severity','?')).upper()}] {f.get('title','')}")
+        for w in wiki_warns:
+            sys.stderr.write(f"  경고(위키 링크): {w}\n")
         return 0
 
     diff = fetch_diff(repo, args.pr)
@@ -210,30 +293,30 @@ def main(argv=None):
         findings, diffmap, body, event=args.event)
 
     if dry:
-        print_console(payload, skipped, warns, dry=True)
+        print_console(payload, skipped, warns, dry=True, wiki_warns=wiki_warns)
+        if not payload["comments"]:
+            print(summary_only_plan(payload["event"], findings, model_summary)[1])
         return 0
 
     if not payload["comments"]:
-        # No inline anchors. Two sub-cases:
-        #   - findings existed but none could be anchored -> still record the
-        #     verdict as a summary-only review so it is not lost to the console.
-        #   - no findings at all (event APPROVE) -> nothing to post; console only.
-        #     (APPROVE is never posted here, so this can never self-approve a PR.)
-        if findings:
+        # No inline anchors, so the summary body is the whole review. It is still worth
+        # posting: a pass that reached a verdict belongs on the PR, not in a console
+        # nobody else reads. `summary_only_plan` decides, and the dry run above printed
+        # the same decision.
+        post, reason = summary_only_plan(payload["event"], findings, model_summary)
+        if post:
             _run(["gh", "api", f"repos/{repo}/pulls/{args.pr}/reviews",
                   "--method", "POST", "--field", f"body={body}",
                   "--field", f"event={payload['event']}"], check=False)
-            print(f"인라인 앵커 없음(전부 skip) — 요약 리뷰만 게시 (event={payload['event']}).")
-        else:
-            print("이슈 없음 — 게시 생략(콘솔만).")
-        print_console(payload, skipped, warns, dry=False)
+        print(reason)
+        print_console(payload, skipped, warns, dry=False, wiki_warns=wiki_warns)
         return 0
 
     res = post_review(repo, args.pr, payload)
     if res["ok"]:
         out = json.loads(res["stdout"])
         print(f"게시 완료: {out.get('html_url')}")
-        print_console(payload, skipped, warns, dry=False)
+        print_console(payload, skipped, warns, dry=False, wiki_warns=wiki_warns)
         return 0
 
     # batch failed (often a single bad anchor). Fall back to per-comment posting
