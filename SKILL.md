@@ -145,11 +145,20 @@ uv run python "$SKILL_DIR/scripts/sweep.py" --base origin/develop
 
 # different-branch: 브랜치 전환 없이 PR head를 detached worktree로 materialize
 git fetch origin <PR_HEAD> -q
-WT=$(mktemp -d)/pr-<PR>; git worktree add --detach "$WT" FETCH_HEAD -q
+WT=<worktree 경로>   # 아래 "worktree 위치" 참조
+git worktree add --detach "$WT" FETCH_HEAD -q
 MB=$(git merge-base origin/develop FETCH_HEAD)
 ( cd "$WT" && uv run python "$SKILL_DIR/scripts/sweep.py" --base "$MB" )
-git worktree remove "$WT" --force
 ```
+
+> **worktree 위치는 에이전트가 정한다.** 사용자 메모리나 프로젝트 지침에 worktree 위치 규칙이 있으면 그대로 따른다. 없으면 다음 조건을 만족하는 경로를 고른다:
+> - 세션이 끝나도 남는 위치. 세션 스크래치패드나 `mktemp` 같은 임시 디렉터리는 쓰지 않는다.
+> - 공간이 넉넉한 위치. `/tmp`는 크기가 작거나 tmpfs(RAM)라서 가득 차기 쉽다. worktree 체크아웃에 스윕이나 `uv`가 만드는 `.venv`·캐시까지 쌓이면 리뷰 도중에 쓰기가 실패한다. `/tmp` 아래는 피하고, 새로 만들기 전에 `df -h <상위 디렉터리>`로 여유 공간을 확인한다.
+> - PR 번호가 드러나는 예측 가능한 이름. 다음 세션에서도 찾을 수 있어야 한다.
+>
+> 같은 PR의 worktree가 이미 있으면(`git worktree list`로 확인) 새로 만들지 말고 그것을 갱신해 쓴다.
+>
+> **worktree는 스윕 뒤에도 지우지 않는다.** Step 3의 소스 열람, 게시 후 작성자와의 문답, 추가 커밋 재검증에 계속 쓴다. 삭제 여부는 Step 8에서 사용자에게 묻는다.
 
 출력 세 섹션을 이렇게 소비한다:
 - **`== HITS ==` / `== MANUAL ==`** — Step 4 이슈 후보의 출발점(각 행은 후보일 뿐, 반드시 Step 6에서 검증). 카테고리별 전수라 "빠뜨림"을 막는다.
@@ -256,6 +265,16 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json
 
 ---
 
+## Step 8. worktree 정리 여부 확인 (different-branch일 때만)
+
+게시한다고 리뷰가 끝나지는 않는다. 작성자 답변, 반박 검증, 추가 커밋 재리뷰가 이어지고, 그때마다 worktree를 다시 만들면 fetch와 셋업을 반복해야 한다. 그래서 **worktree를 임의로 지우지 않는다.**
+
+- 리뷰 URL을 전달할 때 worktree 경로(`$WT`)를 함께 알리고, **지울지 사용자에게 묻는다.** 기본값은 유지다.
+- 사용자가 삭제를 승인했을 때만 `git worktree remove "$WT" --force`를 실행한다.
+- 유지하는 동안 작성자가 새 커밋을 올리면 같은 worktree에서 갱신한다: `git fetch origin <PR_HEAD> -q && git -C "$WT" checkout --detach FETCH_HEAD -q`
+
+---
+
 ## 요약 흐름
 
 ```
@@ -263,6 +282,7 @@ setup_check → 가이드 로드 → (기존 리뷰 읽기) → diff 수집
    → sweep.py(HITS/MANUAL 후보 + UNITS 읽기 바닥선) → 소스 정밀 분석 → findings 초안
    → ★검증 게이트(false-positive 제거)★ → 최종 findings.json
    → review_post.py --dry-run 로 검증 → 이상 없으면 게시
+   → (different-branch) worktree 유지, 삭제 여부는 사용자에게 확인
 ```
 
 두 축의 분업: **발견(discovery)** = `sweep.py`가 결함 범주 전수 + 읽을 루틴 열거로 커버리지를 강제하고, **게시(posting)** = `review_post.py`가 좌표·suggestion·API·event를 결정적으로 처리한다. 모델은 그 사이에서 **판단**(findings.json)만 만든다.
