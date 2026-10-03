@@ -23,6 +23,9 @@ Output (compact, TSV-ish):
     categories that were scanned and had zero hits
     == MANUAL (judge from diff) ==
     categories a script cannot detect; the agent judges them from the diff
+    == REMOVED (...) ==
+    file:line\tsnippet of a deleted line that enforced something (a raise, a guard,
+    a check, a test), unless the same line was added elsewhere in the diff
 """
 
 from __future__ import annotations
@@ -43,6 +46,7 @@ import tomllib
 
 MAX_HITS_PER_CATEGORY = 20
 MAX_SNIPPET_LEN = 160
+MAX_REMOVED_ROWS = 40
 
 CONFIG_PATH = Path(__file__).with_name("patterns.toml")
 
@@ -87,6 +91,9 @@ class Lang:
     skip_lines: re.Pattern[str] | None = None
     linter: Linter | None = None
     dead_code: DeadCode | None = None
+    # A deleted line matching this enforced something; the review asks where the new
+    # code re-establishes it.
+    removed: re.Pattern[str] | None = None
 
 
 @dataclass
@@ -164,6 +171,7 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
                 skip_lines=re.compile(cfg["skip_lines"]) if "skip_lines" in cfg else None,
                 linter=linter,
                 dead_code=dead_code,
+                removed=re.compile(cfg["removed_regex"]) if "removed_regex" in cfg else None,
             )
         )
     return langs, manual, units, jedi_cfg
@@ -219,6 +227,122 @@ def parse_added_ranges(diff_text: str) -> dict[str, list[tuple[int, int]]]:
             if count > 0:
                 ranges[current].append((start, start + count - 1))
     return {f: r for f, r in ranges.items() if r}
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def parse_line_changes(diff_text: str) -> tuple[dict[str, list[tuple[int, str]]], set[str], set[str]]:
+    """Deleted lines per old path, the normalized text of every added line, and the
+    paths deleted outright. Reads a -U0 diff.
+
+    An added definition also contributes `def:<name>`, so a deleted definition whose
+    name comes back (a rewritten test, a changed signature) is not reported as gone.
+    """
+    removed: dict[str, list[tuple[int, str]]] = {}
+    added: set[str] = set()
+    deleted_files: set[str] = set()
+    old_path: str | None = None
+    old_no = 0
+    hunk_re = re.compile(r"^@@ -(\d+)(?:,\d+)? \+")
+    for line in diff_text.splitlines():
+        if line.startswith("--- "):
+            old_path = line[6:] if line.startswith("--- a/") else None
+        elif line.startswith("+++ "):
+            if line.startswith("+++ /dev/null") and old_path:
+                deleted_files.add(old_path)
+        elif m := hunk_re.match(line):
+            old_no = int(m.group(1))
+        elif line.startswith("-"):
+            if old_path:
+                removed.setdefault(old_path, []).append((old_no, line[1:]))
+            old_no += 1
+        elif line.startswith("+"):
+            added.add(_norm(line[1:]))
+            name = _def_name(line[1:])
+            if name:
+                added.add(f"def:{name}")
+    return removed, added, deleted_files
+
+
+_TEST_DEF = re.compile(r"^\s*((async\s+)?def\s+test_|(it|test)(\.\w+)?\()")
+_DEF_NAME = re.compile(r"^\s*(?:async\s+)?(?:def|function|class)\s+(\w+)|^\s*(?:it|test|describe)(?:\.\w+)?\(\s*['\"`]([^'\"`]+)")
+# How far below a deleted test its deleted checks are taken as part of it.
+_TEST_SPAN = 40
+
+
+def _def_name(text: str) -> str | None:
+    m = _DEF_NAME.match(text)
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def _collapse_deleted_tests(path: str, guards: list[tuple[int, str]]) -> list[str]:
+    """One row per deleted test, absorbing the checks deleted below it.
+
+    A check deleted from a test that stays is its own row: the test got weaker.
+    One deleted together with its test is the same fact told twice.
+    """
+    rows: list[str] = []
+    test_row, test_line, absorbed = -1, 0, 0
+    for n, t in guards:
+        is_def = bool(_TEST_DEF.match(t))
+        if test_row >= 0 and not is_def and n - test_line <= _TEST_SPAN:
+            absorbed += 1
+            rows[test_row] = rows[test_row].split("  (+")[0] + f"  (+{absorbed} checks deleted with it)"
+            continue
+        rows.append(f"{path}:{n}\t{t.strip()[:MAX_SNIPPET_LEN]}")
+        test_row, test_line, absorbed = (len(rows) - 1, n, 0) if is_def else (-1, 0, 0)
+    return rows
+
+
+def _merge_repeats(rows: list[str]) -> list[str]:
+    """The same deleted text at several lines of one file is one row with the others named."""
+    first: dict[str, int] = {}
+    more: dict[str, list[str]] = {}
+    out: list[str] = []
+    for row in rows:
+        loc, _, text = row.partition("\t")
+        if text in first:
+            more.setdefault(text, []).append(loc.rsplit(":", 1)[-1])
+            continue
+        first[text] = len(out)
+        out.append(row)
+    for text, lines in more.items():
+        out[first[text]] += f"  (also at {', '.join(lines)})"
+    return out
+
+
+def scan_removed(diff_text: str, langs: list[Lang]) -> list[str]:
+    """Rows for deleted lines that enforced something and did not move elsewhere.
+
+    The pattern scanners read added lines only, so a dropped guard is invisible to
+    them: the code that is gone is exactly what no HIT can point at.
+    """
+    removed, added, deleted_files = parse_line_changes(diff_text)
+    rows: list[str] = []
+    for path, lines in removed.items():
+        lang = lang_for_file(path, langs)
+        if lang is None or lang.removed is None:
+            continue
+        guards = [
+            (n, t) for n, t in lines
+            if lang.removed.search(t)
+            and not (lang.skip_lines and lang.skip_lines.search(t))
+            and not t.lstrip().startswith("#")
+            and _norm(t) not in added
+            and f"def:{_def_name(t)}" not in added
+        ]
+        if not guards:
+            continue
+        if path in deleted_files:
+            rows.append(f"{path}\t(file deleted: {len(lines)} lines, {len(guards)} that enforced something)")
+            continue
+        rows.extend(_merge_repeats(_collapse_deleted_tests(path, guards)))
+    if len(rows) > MAX_REMOVED_ROWS:
+        extra = len(rows) - MAX_REMOVED_ROWS
+        rows = rows[:MAX_REMOVED_ROWS] + [f"-\t(+{extra} more — read the deletions in the diff)"]
+    return rows
 
 
 def in_ranges(lineno: int, rngs: list[tuple[int, int]]) -> bool:
@@ -997,6 +1121,11 @@ def main() -> int:
 
     print("== MANUAL (judge from diff) ==")
     print(", ".join(manual_categories))
+
+    full_diff = run(["git", "diff", "--diff-filter=ACMRD", "-U0", *dargs]).stdout
+    removed_rows = scan_removed(full_diff, langs)
+    print("== REMOVED (name what each enforced; where does the new code re-establish it?) ==")
+    print("\n".join(removed_rows) if removed_rows else "(none)")
 
     units, unit_warnings = scan_units(ranges, by_lang, unit_cfg, jr)
     for w in unit_warnings:
