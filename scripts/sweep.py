@@ -495,14 +495,27 @@ DOC_CATEGORIES = ("DOC-NARRATION", "DOC-LABEL", "DOC-RESTATE", "DOC-STEPS", "DOC
 _DOC_FENCES = ("", '"' * 3, "'" * 3)
 
 
-def _doc_line_hits(hits: Hits, file: str, lineno: int, text: str, docstring: bool) -> None:
-    """Narration, labels, and (comments only) numbered steps / banners on one added line."""
+_BANNER = re.compile(r"^\s*(#|//)\s*[-=*#~]{4,}")
+
+
+def _doc_line_hits(hits: Hits, file: str, lineno: int, text: str, docstring: bool,
+                   last_steps: list[int] | None = None) -> None:
+    """Narration, labels, and (comments only) numbered steps / banners on one added line.
+
+    `last_steps` holds the line of the previous banner hit, so a banner drawn as a
+    pair of rules around a title is one row, not two.
+    """
     if DOCS.narration and DOCS.narration.search(text):
         hits.add("DOC-NARRATION", file, lineno, text)
     if DOCS.label and DOCS.label.search(text):
         hits.add("DOC-LABEL", file, lineno, text)
     if not docstring and DOCS.steps and DOCS.steps.search(text):
+        banner = bool(_BANNER.search(text))
+        if banner and last_steps and lineno - last_steps[0] <= 2:
+            return
         hits.add("DOC-STEPS", file, lineno, text)
+        if last_steps is not None:
+            last_steps[:] = [lineno] if banner else []
 
 
 def _scan_docstrings(hits: Hits, file: str, source: str, lines: list[str], rngs: list[tuple[int, int]]) -> set[int]:
@@ -555,6 +568,7 @@ def scan_docs(hits: Hits, file: str, source: str, rngs: list[tuple[int, int]]) -
     if comment_re is None:
         return
     block: list[int] = []
+    last_steps: list[int] = []
 
     def flush() -> None:
         if len(block) > DOCS.long_comment_block:
@@ -570,7 +584,7 @@ def scan_docs(hits: Hits, file: str, source: str, rngs: list[tuple[int, int]]) -
             if block and block[-1] != n - 1:
                 flush()
             block.append(n)
-            _doc_line_hits(hits, file, n, text, docstring=False)
+            _doc_line_hits(hits, file, n, text, docstring=False, last_steps=last_steps)
         flush()
 
 

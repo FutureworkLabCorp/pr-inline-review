@@ -114,6 +114,16 @@ def test_numbered_steps_and_banners():
     assert _docs(src, [(1, 3)]) == {"DOC-STEPS": ["src/app/x.py:1", "src/app/x.py:3"]}
 
 
+def test_banner_pair_is_one_row():
+    src = "# ----------\n# Section\n# ----------\nx = 1\n"
+    assert _docs(src, [(1, 4)]) == {"DOC-STEPS": ["src/app/x.py:1"]}
+
+
+def test_state_description_is_not_narration():
+    src = "# the head no longer matches the reviewed commit\nx = 1\n"
+    assert _docs(src, [(1, 1)]) == {}
+
+
 def test_args_block_is_a_restate_candidate():
     src = "def f(a: int) -> int:\n    " + Q + "Double it.\n\n    Args:\n        a: the int\n    " + Q + "\n    return a * 2\n"
     assert _docs(src, [(1, 7)]) == {"DOC-RESTATE": ["src/app/x.py:4"]}

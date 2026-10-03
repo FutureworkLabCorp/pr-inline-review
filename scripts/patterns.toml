@@ -23,7 +23,7 @@
 #   steps      numbered step comments and banner dividers
 #   restate    an Args/Returns header that may only repeat the signature
 #   long_*     a candidate, never a verdict: the convention measures information
-doc_narration_regex = '(?i)\b(previously|used to|no longer|anymore|(was|were) changed|we (now|changed|added|fixed|removed|switched)|now (also )?(handles?|returns?|uses?|supports?|accepts?)|this (pr|change|commit|patch)|before this change|after this change|the old (behaviou?r|code|version|implementation)|instead of the old|fix(es|ed)? for|hot ?fix|as of 20\d\d)\b|기존에는|이전에는|예전에는|원래는|이제는|이번 ?(PR|변경|수정|커밋)|수정했|변경했|바꿨|고쳤|추가했|제거했|버그 ?수정'
+doc_narration_regex = '(?i)\b(previously|used to|(was|were) changed|we (now|changed|added|fixed|removed|switched)|now (also )?(handles?|returns?|uses?|supports?|accepts?)|this (pr|change|commit|patch)|before this change|after this change|the old (behaviou?r|code|version|implementation)|instead of the old|fix(es|ed)? for|hot ?fix|as of 20\d\d)\b|기존에는|이전에는|예전에는|원래는|이제는|이번 ?(PR|변경|수정|커밋)|수정했|변경했|바꿨|고쳤|추가했|제거했|버그 ?수정'
 doc_label_regex = '\b(?!(?:SHA|ISO|UTF|RFC|CVE|HTTP|TLS|SSL|AES|RSA|PEP|GPT|BGE|E5)-)[A-Z]{2,6}-\d{2,5}\b|\b(?:Phase|Stage|Step|Wave)\s*\d+\b|\b(?:P\d+-[a-z]|D\d{1,2}|S-\d+|R-\d+)\b'
 doc_steps_regex = '(?i)^\s*(#|//)\s*(\d+[.)]\s|step\s*\d+|\d+\s*단계)|^\s*(#|//)\s*[-=*#~]{4,}'
 doc_restate_regex = '^\s*(Args|Arguments|Parameters|Returns|Yields|Raises):\s*$'
