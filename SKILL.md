@@ -52,12 +52,19 @@ gh auth switch --user <org 권한 있는 handle>
 리뷰 전에 저장소 규칙을 먼저 읽는다. 코드 평가 기준이 된다.
 
 ```bash
-cat AGENTS.md 2>/dev/null                        # 1순위: Agent/리뷰 지침
-ls docs/ 2>/dev/null                             # 2순위: 추가 가이드
-cat CLAUDE.md 2>/dev/null                        # 3순위
+# PR이 규칙 문서 자체를 바꿨을 수 있으니 base 브랜치 판본을 기준으로 삼는다
+# BASE = PR의 baseRefName (gh pr view <PR> --json baseRefName), 로컬 리뷰면 develop
+git fetch origin "$BASE" -q
+git show "origin/$BASE:AGENTS.md"                 # 1순위: Agent/리뷰 지침 (정본)
+git show "origin/$BASE:.docs/Code-Conventions.md" # 2순위: 컨벤션 전체 목록
+ls .docs/                                         # 나머지는 주제가 걸릴 때만
 ```
 
+`.docs/`의 나머지는 해당 주제가 diff에 있을 때만 읽는다: 테스트 갭이면 `Testing.md`, Cypher가 바뀌었으면 `Compatible-ArcadeDB.md`, 의존성·compose `image:`가 바뀌었으면 `Onprem-Licensing.md`. (`docs/`는 다른 용도의 디렉토리다 — 규칙 문서는 `.docs/`에 있다.)
+
 메모할 기준: 최소 변경 원칙 / 기존 패턴 우선 / 보안·정확성·생명주기 우선 / 새 추상화는 real complexity를 제거할 때만 / 근거 없는 동의 금지.
+
+**규칙 위반 finding은 규칙을 인용한다.** "컨벤션 위반"이라고만 쓰지 않고, 근거가 된 문장을 가장 짧게 인용하고 출처(`.docs/Code-Conventions.md`의 해당 항목)를 단다. 그 규칙이 이 파일 경로에 실제로 적용되는지(예: 상대 import 규칙은 `src/` 안에만) 확인한다. 인용할 문장을 못 찾으면 규칙 위반이 아니다 — 규칙 파일이 있다는 이유로 finding을 만들지 않는다. 반대로 PR이 규칙 문서·위키의 서술을 틀리게 만들면 그것도 finding이다(AGENTS.md: 문서가 틀려지면 고친다).
 
 **설계 패턴 레퍼런스(스킬 동봉):** `$SKILL_DIR/reference/patterns.md` — DB 컬럼 vs JSONB, hook/transaction 경계, ACL 적용 위치, RAG 파이프라인, lifecycle state machine 등 §1~§16 판단 기준. 전부 미리 읽지 말고 **Step 4에서 설계 판단이 걸리는 finding이 나올 때 해당 §만** 참조한다. (`$SKILL_DIR` = 이 SKILL.md가 있는 디렉토리의 절대경로)
 
@@ -160,9 +167,12 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 >
 > **worktree는 스윕 뒤에도 지우지 않는다.** Step 3의 소스 열람, 게시 후 작성자와의 문답, 추가 커밋 재검증에 계속 쓴다. 삭제 여부는 Step 8에서 사용자에게 묻는다.
 
-출력 세 섹션을 이렇게 소비한다:
-- **`== HITS ==` / `== MANUAL ==`** — Step 4 이슈 후보의 출발점(각 행은 후보일 뿐, 반드시 Step 6에서 검증). 카테고리별 전수라 "빠뜨림"을 막는다.
+출력 네 섹션을 이렇게 소비한다:
+- **`== HITS ==` / `== MANUAL ==`** — Step 4 이슈 후보의 출발점(각 행은 후보일 뿐, 반드시 Step 6에서 검증). 카테고리별 전수라 "빠뜨림"을 막는다. **행마다 무엇을 물을지는 `$SKILL_DIR/reference/sweep-categories.md`** 의 해당 카테고리 행을 본다(나온 카테고리만). HIT는 첫 행만이 아니라 전부 판정한다.
+- **`== SWEPT-NONE ==`** — 스캔했고 후보가 없던 카테고리. 할 일 없음, 커버리지 기록에만 옮긴다.
 - **`== UNITS ==`** — diff가 건드린 **모든 루틴**(Python=`ast`, TS/TSX=tree-sitter). 이게 "무엇을 읽을지"의 **바닥선**이다: 패턴이 침묵한 의도(intent) 버그에 닿는 통로. 각 UNIT을 `Read(file, offset, limit)`로 읽고 Step 4에서 finding 또는 "read, clean"으로 처리한다. `func`=함수 통째(데코 포함), `block`=거대 함수의 hunk 블록만(+`oversized-fn` 플래그=자체 finding 후보), `module`=모듈 레벨. `callees`/`callers`는 HIT/타입경계가 필요를 만들 때만 한 홉 확장.
+
+**커버리지 기록.** 스윕이 낸 모든 카테고리와 모든 UNIT에 판정을 남긴다 — finding / "swept, none" / "read, clean" / "판정 보류(이유)". 이 기록은 `_summary` 끝에 접힌 블록(`<details><summary>스윕 커버리지</summary> … </details>`)으로 넣는다. 리뷰어가 "이 범주는 봤는가"를 PR에서 확인할 수 있고, 이름이 빠진 카테고리는 스윕을 건너뛴 것으로 간주된다. 판정을 보류한 동작(범위 밖이라 판단을 미룬 것)도 이유와 함께 적는다 — 조용히 빠지는 항목이 없게 한다.
 
 **린터 정책 (ruff / eslint).** ruff(Python)는 순수 정적 린트라 항상 돈다. **eslint(TypeScript)**는 트리의 `node_modules`(플러그인·파서·tsconfig)가 필요해 **local-only**다 — 스캔 트리에 `node_modules/.bin/eslint`가 있을 때만 자동 실행되고, 없으면 조용히 skip(경고 한 줄)된다. 그래서 worktree(리모트 PR)엔 `node_modules`가 없어 eslint는 기본 빠지고 regex·AST·dead-code·ruff는 정상 동작한다. eslint까지 강제하려면 원본 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고 **TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: AxFlow `pr-code-review`)에 맡긴다**.
 

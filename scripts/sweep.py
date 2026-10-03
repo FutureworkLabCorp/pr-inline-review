@@ -68,10 +68,20 @@ class DeadCode:
 
 
 @dataclass
+class PatternRule:
+    category: str
+    regex: re.Pattern[str]
+    exclude: re.Pattern[str] | None = None
+    # Restricts the rule to files whose repo-relative path matches; a rule that only
+    # holds for one tree (e.g. "imports under src/ are relative") stays quiet elsewhere.
+    paths: re.Pattern[str] | None = None
+
+
+@dataclass
 class Lang:
     name: str
     extensions: tuple[str, ...]
-    patterns: list[tuple[str, re.Pattern[str], re.Pattern[str] | None]]
+    patterns: list[PatternRule]
     special: list[str] = field(default_factory=list)
     match_shebang: bool = False
     skip_lines: re.Pattern[str] | None = None
@@ -117,10 +127,11 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         if name == "global":
             continue
         patterns = [
-            (
+            PatternRule(
                 p["category"],
                 re.compile(p["regex"]),
                 re.compile(p["exclude"]) if "exclude" in p else None,
+                re.compile(p["paths"]) if "paths" in p else None,
             )
             for p in cfg.get("patterns", [])
         ]
@@ -236,19 +247,20 @@ def scan_patterns(
     file: str,
     lines: list[str],
     rngs: list[tuple[int, int]],
-    patterns: list[tuple[str, re.Pattern[str], re.Pattern[str] | None]],
+    patterns: list[PatternRule],
     skip_lines: re.Pattern[str] | None = None,
 ) -> None:
+    patterns = [p for p in patterns if p.paths is None or p.paths.search(file)]
     for start, end in rngs:
         for lineno in range(start, min(end, len(lines)) + 1):
             text = lines[lineno - 1]
             if skip_lines is not None and skip_lines.search(text):
                 continue
-            for cat, pat, exclude in patterns:
-                if exclude is not None and exclude.search(text):
+            for p in patterns:
+                if p.exclude is not None and p.exclude.search(text):
                     continue
-                if pat.search(text):
-                    hits.add(cat, file, lineno, text)
+                if p.regex.search(text):
+                    hits.add(p.category, file, lineno, text)
 
 
 # --- Special (code) scanners: AST checks config can't express ----------------
@@ -872,8 +884,8 @@ def scanned_categories(
     for lang in langs:
         if lang.name not in active:
             continue
-        for cat, _, _ in lang.patterns:
-            add(cat)
+        for p in lang.patterns:
+            add(p.category)
         for s in lang.special:
             add(SPECIAL_SCANNERS[s][1])
         if lang.linter and lang.name in ran_linters:

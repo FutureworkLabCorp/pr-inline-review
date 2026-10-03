@@ -6,7 +6,9 @@
 #   extensions       list of file suffixes that select this language
 #   match_shebang    also match extensionless files whose shebang is sh/bash
 #   special_scanners named code hooks in sweep.py (AST checks config can't express)
-#   [[<lang>.patterns]]  {category, regex, exclude?}  scanned on ADDED lines only
+#   [[<lang>.patterns]]  {category, regex, exclude?, paths?}  scanned on ADDED lines only;
+#                        `paths` is a regex on the repo-relative file path that limits
+#                        the rule to the tree it holds for
 #   [<lang>.linter]      {command, parser, runner?, code_map}  external linter lane
 #   [<lang>.dead_code]   {def_regex, grep_glob, skip_names?}   added defs w/ 0 external refs
 
@@ -59,6 +61,31 @@ regex = '\b\w*(create|insert|register|acquire|upload)\w*\(|\b(store|put)_\w+\('
 [[py.patterns]]
 category = "WRITE-AUTH"
 regex = '\b(db|session)\.(add|delete|merge)\b|\b(update|delete|remove)_\w+\('
+
+[[py.patterns]]
+category = "SILENT-FAILURE"
+# A broad catch can turn a real error into a default value nobody sees.
+regex = '^\s*except\s*:|^\s*except\s*\(?\s*(Exception|BaseException)\b|suppress\(\s*(Exception|BaseException)\b'
+# A catch the author already silenced with a noqa has been decided on; leave it be.
+exclude = 'noqa:[^#]*\b(BLE001|S110|E722)\b'
+
+[[py.patterns]]
+category = "PY310-COMPAT"
+# The code must stay Python 3.10-compatible although requires-python is newer, and
+# ruff's target-version only polices syntax, not these stdlib/typing APIs.
+regex = '^\s*except\*|\bStrEnum\b|\bdatetime\.UTC\b|from\s+datetime\s+import[^#]*\bUTC\b|^\s*(from\s+tomllib\b|import\s+tomllib\b)|\bExceptionGroup\b|\basyncio\.(TaskGroup|timeout)\b|\bitertools\.batched\b|\btyping\.(Self|override|Never|LiteralString|assert_never|Required|NotRequired|Unpack|TypeVarTuple|dataclass_transform)\b|from\s+typing\s+import[^#]*\b(Self|override|Never|LiteralString|assert_never|Required|NotRequired|Unpack|TypeVarTuple|dataclass_transform)\b|^\s*type\s+\w+(\[[^\]]*\])?\s*=|^\s*(async\s+)?def\s+\w+\[|^\s*class\s+\w+\['
+exclude = 'typing_extensions|^\s*#'
+
+[[py.patterns]]
+category = "ABS-IMPORT"
+# Imports inside src/ are relative; tests and extensions legitimately import src.app.
+regex = '^\s*(from|import)\s+src\.app\b'
+paths = '^src/'
+
+[[py.patterns]]
+category = "CYPHER-COMPAT"
+# A graph query has to read the same on Neo4j and ArcadeDB, which silently differ.
+regex = '\b(OPTIONAL\s+MATCH|MATCH|MERGE|UNWIND|DETACH\s+DELETE|CALL\s*\{)\s*[\(\{$a-z]'
 
 [py.linter]
 command = ["ruff", "check", "--select", "ASYNC,S", "--output-format", "concise", "--no-fix"]
