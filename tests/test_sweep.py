@@ -80,6 +80,63 @@ def test_comment_is_not_a_guard():
 
 
 # --------------------------------------------------------------------------- #
+# DOC-*
+# --------------------------------------------------------------------------- #
+
+Q = '"' * 3  # a docstring fence, kept out of the literals below
+
+
+def _docs(source, rngs, path="src/app/x.py"):
+    hits = S.Hits()
+    S.scan_docs(hits, path, source, rngs)
+    return {cat: [r.split("\t")[1] for r in rows] for cat, rows in hits.by_cat.items()}
+
+
+def test_narrating_docstring_is_flagged_on_added_lines_only():
+    src = "def f():\n    " + Q + "Return the total.\n\n    Previously this dropped zeros.\n    " + Q + "\n    return 1\n"
+    assert _docs(src, [(4, 4)]) == {"DOC-NARRATION": ["src/app/x.py:4"]}
+    assert _docs(src, [(6, 6)]) == {}          # the docstring was not touched
+
+
+def test_korean_narration_and_ticket_label_in_comments():
+    src = "x = 1\n# 기존에는 0을 버렸는데 FUT-1234 이후 남긴다\ny = 2\n"
+    got = _docs(src, [(2, 2)])
+    assert got == {"DOC-NARRATION": ["src/app/x.py:2"], "DOC-LABEL": ["src/app/x.py:2"]}, got
+
+
+def test_standard_names_are_not_labels():
+    src = "# hashes with SHA-256 and dates in ISO-8601\nx = 1\n"
+    assert _docs(src, [(1, 1)]) == {}
+
+
+def test_numbered_steps_and_banners():
+    src = "# 1. load\nx = 1\n# ------ section ------\n"
+    assert _docs(src, [(1, 3)]) == {"DOC-STEPS": ["src/app/x.py:1", "src/app/x.py:3"]}
+
+
+def test_args_block_is_a_restate_candidate():
+    src = "def f(a: int) -> int:\n    " + Q + "Double it.\n\n    Args:\n        a: the int\n    " + Q + "\n    return a * 2\n"
+    assert _docs(src, [(1, 7)]) == {"DOC-RESTATE": ["src/app/x.py:4"]}
+
+
+def test_long_private_docstring_written_by_the_change():
+    body = "\n".join(f"    line {i}." for i in range(5))
+    src = "def _f():\n    " + Q + "Start.\n" + body + "\n    " + Q + "\n    return 1\n"
+    assert _docs(src, [(1, 9)])["DOC-LONG"] == ["src/app/x.py:2"]
+    assert "DOC-LONG" not in _docs(src, [(3, 3)])   # touched one line of an old docstring
+
+
+def test_long_comment_block():
+    src = "\n".join("# note" for _ in range(7)) + "\nx = 1\n"
+    assert _docs(src, [(1, 8)]) == {"DOC-LONG": ["src/app/x.py:1"]}
+
+
+def test_ts_comment_narration():
+    src = "// this PR now handles nulls\nconst a = 1\n"
+    assert _docs(src, [(1, 1)], path="web/a.ts") == {"DOC-NARRATION": ["web/a.ts:1"]}
+
+
+# --------------------------------------------------------------------------- #
 # bare-python runner
 # --------------------------------------------------------------------------- #
 

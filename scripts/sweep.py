@@ -105,6 +105,23 @@ class UnitConfig:
 
 
 @dataclass
+class DocsConfig:
+    """What makes an added docstring or comment a candidate (patterns.toml [global])."""
+    narration: re.Pattern[str] | None = None
+    label: re.Pattern[str] | None = None
+    steps: re.Pattern[str] | None = None
+    restate: re.Pattern[str] | None = None
+    long_docstring: int = 8
+    long_private_docstring: int = 3
+    long_comment_block: int = 6
+
+
+# Set by load_config(); the special scanners share one signature and read it here.
+DOCS = DocsConfig()
+COMMENT_RE: dict[str, re.Pattern[str]] = {}
+
+
+@dataclass
 class JediConfig:
     enabled: bool = True
     roots: list[str] = field(default_factory=lambda: ["src"])
@@ -122,6 +139,20 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         coverage_promote=float(g.get("unit_coverage_promote", 0.4)),
         callers_max=int(g.get("unit_callers_max", 5)),
         max_blocks=int(g.get("unit_max_blocks", 3)),
+    )
+    global DOCS
+
+    def _re(key: str) -> re.Pattern[str] | None:
+        return re.compile(g[key]) if key in g else None
+
+    DOCS = DocsConfig(
+        narration=_re("doc_narration_regex"),
+        label=_re("doc_label_regex"),
+        steps=_re("doc_steps_regex"),
+        restate=_re("doc_restate_regex"),
+        long_docstring=int(g.get("doc_long_docstring", 8)),
+        long_private_docstring=int(g.get("doc_long_private_docstring", 3)),
+        long_comment_block=int(g.get("doc_long_comment_block", 6)),
     )
     jedi_cfg = JediConfig(
         enabled=bool(g.get("jedi_enabled", True)),
@@ -174,6 +205,9 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
                 removed=re.compile(cfg["removed_regex"]) if "removed_regex" in cfg else None,
             )
         )
+        if "comment_regex" in cfg:
+            for ext in cfg.get("extensions", []):
+                COMMENT_RE[ext] = re.compile(cfg["comment_regex"])
     return langs, manual, units, jedi_cfg
 
 
@@ -430,8 +464,92 @@ def scan_loop_isolation(
 
 
 # name -> (function(hits, file, source, rngs), category it can emit)
+DOC_CATEGORIES = ("DOC-NARRATION", "DOC-LABEL", "DOC-RESTATE", "DOC-STEPS", "DOC-LONG")
+_DOC_FENCES = ("", '"' * 3, "'" * 3)
+
+
+def _doc_line_hits(hits: Hits, file: str, lineno: int, text: str, docstring: bool) -> None:
+    """Narration, labels, and (comments only) numbered steps / banners on one added line."""
+    if DOCS.narration and DOCS.narration.search(text):
+        hits.add("DOC-NARRATION", file, lineno, text)
+    if DOCS.label and DOCS.label.search(text):
+        hits.add("DOC-LABEL", file, lineno, text)
+    if not docstring and DOCS.steps and DOCS.steps.search(text):
+        hits.add("DOC-STEPS", file, lineno, text)
+
+
+def _scan_docstrings(hits: Hits, file: str, source: str, lines: list[str], rngs: list[tuple[int, int]]) -> set[int]:
+    """Judge added docstring lines; returns every docstring line so comments skip them."""
+    doc_lines: set[int] = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return doc_lines
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = node.body
+        if not (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            continue
+        start, end = body[0].lineno, body[0].end_lineno or body[0].lineno
+        doc_lines.update(range(start, end + 1))
+        added = [n for n in range(start, end + 1) if in_ranges(n, rngs)]
+        if not added:
+            continue
+        for n in added:
+            text = lines[n - 1]
+            _doc_line_hits(hits, file, n, text, docstring=True)
+            if DOCS.restate and DOCS.restate.search(text):
+                hits.add("DOC-RESTATE", file, n, text)
+        name = getattr(node, "name", "<module>")
+        private = name.startswith("_") and not name.startswith("__")
+        size = sum(1 for n in range(start, end + 1) if lines[n - 1].strip() not in _DOC_FENCES)
+        limit = DOCS.long_private_docstring if private else DOCS.long_docstring
+        # A long docstring the change mostly wrote; one it only touched is not its doing.
+        if size > limit and len(added) * 2 >= end - start + 1:
+            hits.add("DOC-LONG", file, start, f"{name}: docstring of {size} lines (> {limit})")
+    return doc_lines
+
+
+def scan_docs(hits: Hits, file: str, source: str, rngs: list[tuple[int, int]]) -> None:
+    """Added docstrings and comments that tell the change's story instead of the code's.
+
+    Mirrors linkBrain-server's .docs/Code-Conventions.md "Docstrings and comments":
+    no narrating your own work, no labels whose meaning lives elsewhere, no
+    numbered steps or banners, no Args/Returns that repeat the signature. Length is
+    only a candidate there ("information rather than line count"), so DOC-LONG
+    asks the question and never decides it. Only added lines are judged, so an old
+    docstring next to the change is not blamed on it.
+    """
+    lines = source.splitlines()
+    doc_lines = _scan_docstrings(hits, file, source, lines, rngs) if file.endswith(".py") else set()
+    comment_re = COMMENT_RE.get(Path(file).suffix)
+    if comment_re is None:
+        return
+    block: list[int] = []
+
+    def flush() -> None:
+        if len(block) > DOCS.long_comment_block:
+            hits.add("DOC-LONG", file, block[0], f"comment block of {len(block)} lines (> {DOCS.long_comment_block})")
+        block.clear()
+
+    for start, end in rngs:
+        for n in range(start, min(end, len(lines)) + 1):
+            text = lines[n - 1]
+            if n in doc_lines or not comment_re.search(text):
+                flush()
+                continue
+            if block and block[-1] != n - 1:
+                flush()
+            block.append(n)
+            _doc_line_hits(hits, file, n, text, docstring=False)
+        flush()
+
+
 SPECIAL_SCANNERS: dict[str, tuple] = {
     "loop_isolation": (scan_loop_isolation, "LOOP-ISOLATION"),
+    "docs": (scan_docs, DOC_CATEGORIES),
 }
 
 
@@ -1011,7 +1129,9 @@ def scanned_categories(
         for p in lang.patterns:
             add(p.category)
         for s in lang.special:
-            add(SPECIAL_SCANNERS[s][1])
+            cats = SPECIAL_SCANNERS[s][1]
+            for c in cats if isinstance(cats, tuple) else (cats,):
+                add(c)
         if lang.linter and lang.name in ran_linters:
             for v in lang.linter.code_map.values():
                 add(v)

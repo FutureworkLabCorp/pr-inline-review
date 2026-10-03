@@ -11,10 +11,25 @@
 #                        the rule to the tree it holds for
 #   [<lang>.linter]      {command, parser, runner?, code_map}  external linter lane
 #   [<lang>.dead_code]   {def_regex, grep_glob, skip_names?}   added defs w/ 0 external refs
+#   comment_regex    a whole-line comment, for the `docs` special scanner
 #   removed_regex    a DELETED line matching it enforced something (raise, guard, check,
 #                    test); listed under REMOVED unless the same line moved elsewhere
 
 [global]
+# Docstrings and comments (the `docs` special scanner), after linkBrain-server's
+# .docs/Code-Conventions.md "Docstrings and comments". Only ADDED lines are judged.
+#   narration  the change telling its own story: "previously", "this PR", "기존에는"
+#   label      a code whose meaning lives elsewhere: FUT-123, Phase 2, D5
+#   steps      numbered step comments and banner dividers
+#   restate    an Args/Returns header that may only repeat the signature
+#   long_*     a candidate, never a verdict: the convention measures information
+doc_narration_regex = '(?i)\b(previously|used to|no longer|anymore|(was|were) changed|we (now|changed|added|fixed|removed|switched)|now (also )?(handles?|returns?|uses?|supports?|accepts?)|this (pr|change|commit|patch)|before this change|after this change|the old (behaviou?r|code|version|implementation)|instead of the old|fix(es|ed)? for|hot ?fix|as of 20\d\d)\b|기존에는|이전에는|예전에는|원래는|이제는|이번 ?(PR|변경|수정|커밋)|수정했|변경했|바꿨|고쳤|추가했|제거했|버그 ?수정'
+doc_label_regex = '\b(?!(?:SHA|ISO|UTF|RFC|CVE|HTTP|TLS|SSL|AES|RSA|PEP|GPT|BGE|E5)-)[A-Z]{2,6}-\d{2,5}\b|\b(?:Phase|Stage|Step|Wave)\s*\d+\b|\b(?:P\d+-[a-z]|D\d{1,2}|S-\d+|R-\d+)\b'
+doc_steps_regex = '(?i)^\s*(#|//)\s*(\d+[.)]\s|step\s*\d+|\d+\s*단계)|^\s*(#|//)\s*[-=*#~]{4,}'
+doc_restate_regex = '^\s*(Args|Arguments|Parameters|Returns|Yields|Raises):\s*$'
+doc_long_docstring = 8
+doc_long_private_docstring = 3
+doc_long_comment_block = 6
 # Review-unit sizing (Python == UNITS ==). A changed function <= size_threshold is read
 # whole; a larger one touched only sparsely is read as the hunk's enclosing block, unless
 # the diff covers >= coverage_promote of it (then promoted back to a whole read).
@@ -51,7 +66,8 @@ manual_categories = [
 [py]
 extensions = [".py"]
 removed_regex = '^\s*(raise|assert)\b|^\s*except\b|^\s*if\b.*(\bnot\b|\bis None\b|\bis not\b|\bisinstance\(|\bhasattr\(|[<>]=?|[!=]=)|\b\w*(check|verify|validate|ensure|require|authori[sz]e|permission|forbid|deny|acquire|release|rollback|cleanup|close)\w*\(|^\s*(async\s+)?def\s+test_|^\s*@pytest\.mark\.|^\s*(async\s+)?with\s+.*\b(lock|transaction|begin)\b'
-special_scanners = ["loop_isolation"]
+special_scanners = ["loop_isolation", "docs"]
+comment_regex = '^\s*#(?!!)'
 
 [[py.patterns]]
 category = "SSRF-OUTBOUND"
@@ -106,6 +122,8 @@ skip_names = '^__\w+__$|^test_'
 # --------------------------------------------------------------------------- sh
 [sh]
 extensions = [".sh", ".bash"]
+special_scanners = ["docs"]
+comment_regex = '^\s*#(?!!)'
 removed_regex = '^\s*set\s+-[a-z]*[euo]|\|\|\s*(exit|return)\b|\[\[?\s+-[znfde]\s|^\s*trap\b'
 match_shebang = true
 
@@ -128,6 +146,8 @@ regex = '/tmp/\w'
 # --------------------------------------------------------------------------- ts
 [ts]
 extensions = [".ts", ".tsx"]
+special_scanners = ["docs"]
+comment_regex = '^\s*(//|/\*|\*)'
 removed_regex = '^\s*throw\b|^\s*if\s*\(.*(!|===?|!==?|[<>]=?|\binstanceof\b|\btypeof\b)|\b\w*(check|verify|validate|ensure|require|authori[sz]e|permission|forbid|deny)\w*\(|^\s*(it|test|describe)(\.\w+)?\(|\bcatch\s*\('
 # Skip comment-only lines so prose ("renders as a chip", "counts as loading") does not
 # trip the word-based patterns below.
