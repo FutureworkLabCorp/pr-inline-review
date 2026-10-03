@@ -167,9 +167,34 @@ def test_trivial_repeats_are_not_duplicates():
 
 
 def test_test_paths_are_skipped():
-    assert S._dup_skipped("tests/unit_tests/x/test_a.py")
-    assert S._dup_skipped("web/src/a.test.tsx")
-    assert not S._dup_skipped("src/app/rag/ingest.py")
+    assert S._is_test_path("tests/unit_tests/x/test_a.py")
+    assert S._is_test_path("web/src/a.test.tsx")
+    assert not S._is_test_path("src/app/rag/ingest.py")
+
+
+# --------------------------------------------------------------------------- #
+# second caller hop
+# --------------------------------------------------------------------------- #
+
+def test_second_hop_skips_tests_private_and_common_callers():
+    import types
+    grep_out = "\n".join([
+        "src/app/a.py:10:    total = changed()",      # caller `public_entry` -> followed
+        "src/app/b.py:20:    x = changed()",          # caller `_private` -> not followed
+        "src/app/c.py:30:    changed()",              # caller `run` -> not followed
+        "tests/test_x.py:5:    changed()",            # test path -> not followed
+        "src/app/d.py:1:def changed():",              # the definition itself
+    ])
+    enclosing = {"src/app/a.py": "public_entry", "src/app/b.py": "_private", "src/app/c.py": "run"}
+    saved = (S.run, S._enclosing_func, S._callers)
+    try:
+        S.run = lambda cmd, **kw: types.SimpleNamespace(stdout=grep_out, returncode=0)
+        S._enclosing_func = lambda path, line: types.SimpleNamespace(name=enclosing[path]) if path in enclosing else None
+        S._callers = lambda name, path, glob, limit, *a: [f"src/app/api_{name}.py"]
+        got = S._second_hop("changed", "src/app/d.py", "*.py", 5)
+    finally:
+        S.run, S._enclosing_func, S._callers = saved
+    assert got == ["src/app/api_public_entry.py(via public_entry)"], got
 
 
 # --------------------------------------------------------------------------- #

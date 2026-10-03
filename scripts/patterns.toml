@@ -37,13 +37,18 @@ doc_long_comment_block = 6
 dup_window = 4
 dup_min_line = 40
 dup_max_greps = 40
-dup_skip_paths = '(^|/)tests?/|(^|/)test_[^/]*$|_test\.py$|\.(test|spec)\.tsx?$'
+# Test files: skipped by DUP-* and by the second caller hop (not a production path).
+test_paths = '(^|/)tests?/|(^|/)test_[^/]*$|_test\.py$|\.(test|spec)\.tsx?$'
 # Review-unit sizing (Python == UNITS ==). A changed function <= size_threshold is read
 # whole; a larger one touched only sparsely is read as the hunk's enclosing block, unless
 # the diff covers >= coverage_promote of it (then promoted back to a whole read).
 unit_size_threshold = 120
 unit_coverage_promote = 0.4
 unit_max_blocks = 3
+# 1 lists the changed function's callers; 2 also their callers (sweep --caller-depth 2).
+unit_caller_depth = 1
+# Not followed on the second hop: text search would match every unrelated function so named.
+unit_common_names = '^(run|execute|main|get|set|update|create|delete|call|handle|process|apply|wrapper|inner|decorator|invoke|dispatch|load|save)$'
 unit_callers_max = 5
 
 # Reference resolution for DEAD-CODE and unit callers (Python only). When jedi is

@@ -15,6 +15,7 @@ Usage:
     python sweep.py --staged
     python sweep.py --worktree
     python sweep.py --base origin/develop
+    python sweep.py --base origin/develop --caller-depth 2   # also callers of callers
 
 Output (compact, TSV-ish):
     == HITS ==
@@ -102,6 +103,8 @@ class UnitConfig:
     coverage_promote: float = 0.4
     callers_max: int = 5
     max_blocks: int = 3
+    # 2 also lists the callers of each caller; a deeper round asks for it.
+    caller_depth: int = 1
 
 
 @dataclass
@@ -122,11 +125,14 @@ class DupConfig:
     window: int = 4
     min_line: int = 40
     max_greps: int = 40
-    # Tests repeat their setup on purpose and reuse helper names across files.
-    skip_paths: re.Pattern[str] | None = None
 
 
 DUP = DupConfig()
+# Test files: skipped by DUP-* (tests repeat setup and helper names on purpose) and by
+# the second caller hop (a test calling a function is not a production call path).
+TEST_PATHS: re.Pattern[str] | None = None
+# Names too common to follow by text search: grep finds every unrelated `run`.
+COMMON_NAMES: re.Pattern[str] | None = None
 DUP_CATEGORIES = ("DUP-IN-DIFF", "DUP-NAME", "DUP-EXISTING")
 
 # Set by load_config(); the special scanners share one signature and read it here.
@@ -152,8 +158,9 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         coverage_promote=float(g.get("unit_coverage_promote", 0.4)),
         callers_max=int(g.get("unit_callers_max", 5)),
         max_blocks=int(g.get("unit_max_blocks", 3)),
+        caller_depth=int(g.get("unit_caller_depth", 1)),
     )
-    global DOCS, DUP
+    global DOCS, DUP, TEST_PATHS, COMMON_NAMES
 
     def _re(key: str) -> re.Pattern[str] | None:
         return re.compile(g[key]) if key in g else None
@@ -171,8 +178,9 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         window=int(g.get("dup_window", 4)),
         min_line=int(g.get("dup_min_line", 40)),
         max_greps=int(g.get("dup_max_greps", 40)),
-        skip_paths=_re("dup_skip_paths"),
     )
+    TEST_PATHS = _re("test_paths")
+    COMMON_NAMES = _re("unit_common_names")
     jedi_cfg = JediConfig(
         enabled=bool(g.get("jedi_enabled", True)),
         roots=list(g.get("jedi_roots", ["src"])),
@@ -799,6 +807,60 @@ def _callers(
     return files
 
 
+_FUNCS_CACHE: dict[str, list[FuncInfo] | None] = {}
+
+
+def _enclosing_func(path: str, line: int) -> FuncInfo | None:
+    """The innermost function around `line` in `path`, parsed once per file."""
+    if path not in _FUNCS_CACHE:
+        try:
+            source = Path(path).read_text(errors="replace")
+        except OSError:
+            source = None
+        if source is None:
+            _FUNCS_CACHE[path] = None
+        elif path.endswith(".py"):
+            _FUNCS_CACHE[path] = py_extract_funcs(source)
+        elif path.endswith((".ts", ".tsx")) and _ts_parser("typescript") is not None:
+            _FUNCS_CACHE[path] = ts_extract_funcs(source, path.endswith(".tsx"))
+        else:
+            _FUNCS_CACHE[path] = None
+    best = None
+    for fi in _FUNCS_CACHE[path] or []:
+        if fi.lineno <= line <= fi.end and (best is None or fi.lineno > best.lineno):
+            best = fi
+    return best
+
+
+def _second_hop(name: str, deffile: str, glob: str, limit: int) -> list[str]:
+    """Callers of the functions that call `name`, as `file(via caller)`.
+
+    One hop shows who calls the changed function; a changed return shape, raised
+    exception or precondition often breaks the caller's caller, which handled the
+    old behaviour without knowing it.
+    """
+    out = run(["git", "grep", "-n", "-I", rf"\b{name}\b", "--", glob])
+    seen: list[str] = []
+    for ln in out.stdout.splitlines():
+        path, no, text = (ln.split(":", 2) + ["", ""])[:3]
+        if path == deffile or not no.isdigit() or re.search(rf"\b(def|class|function|const)\s+{name}\b", text):
+            continue
+        if _is_test_path(path):
+            continue
+        fi = _enclosing_func(path, int(no))
+        # A private caller is called from its own module, which the reviewer reads anyway;
+        # a common name would match every unrelated function of that name.
+        if fi is None or fi.name == name or fi.name.startswith("_") or (COMMON_NAMES and COMMON_NAMES.match(fi.name)):
+            continue
+        for p2 in _callers(fi.name, path, glob, limit):
+            entry = f"{p2}(via {fi.name})"
+            if entry not in seen:
+                seen.append(entry)
+        if len(seen) >= limit * 2:
+            break
+    return seen[: limit * 2]
+
+
 PY_BLOCK_NODES = (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.AsyncFor, ast.AsyncWith)
 
 
@@ -971,6 +1033,8 @@ def _units_for_file(
         callees = fi.callees[:8]
         callers = _callers(fi.name, f, glob, cfg.callers_max, jr, fi.lineno)
         info = f"callees={','.join(callees) or '-'} callers={','.join(callers) or '-'}"
+        if cfg.caller_depth >= 2:
+            info += f" callers2={','.join(_second_hop(fi.name, f, glob, cfg.callers_max)) or '-'}"
         blocks = sorted({_enclosing_block(fi, hs, he) for hs, he in hunks})
         if (
             size <= cfg.size_threshold
@@ -1170,14 +1234,14 @@ _TRIVIAL = re.compile(r"^\s*([)}\]]+[,;]?|else:|try:|finally:|pass|return|break|
 _NOT_LOGIC = re.compile(r"^\s*(import\b|from\s+\S+\s+import\b|@|#|//|\*|(async\s+)?def\b|class\b|export\s+(async\s+)?(function|const|class)\b)")
 
 
-def _dup_skipped(path: str) -> bool:
-    return bool(DUP.skip_paths and DUP.skip_paths.search(path))
+def _is_test_path(path: str) -> bool:
+    return bool(TEST_PATHS and TEST_PATHS.search(path))
 
 
 def _added_lines(ranges: dict[str, list[tuple[int, int]]], files: list[str]) -> dict[str, dict[int, str]]:
     out: dict[str, dict[int, str]] = {}
     for f in files:
-        if _dup_skipped(f):
+        if _is_test_path(f):
             continue
         try:
             lines = Path(f).read_text(errors="replace").splitlines()
@@ -1230,7 +1294,7 @@ def _dup_name(hits: Hits, diff_text: str, langs: list[Lang]) -> None:
             if line.startswith("+++ b/"):
                 current = line[6:]
                 continue
-            if not (current and Path(current).suffix in lang.extensions) or _dup_skipped(current):
+            if not (current and Path(current).suffix in lang.extensions) or _is_test_path(current):
                 continue
             m = dc.def_re.match(line)
             # Module level only: two methods may share a name on purpose.
@@ -1241,7 +1305,7 @@ def _dup_name(hits: Hits, diff_text: str, langs: list[Lang]) -> None:
                 continue
             out = run(["git", "grep", "-n", "-I", "-E", rf"^(export\s+)?(async\s+)?(def|class|function|const)\s+{name}\b", "--", dc.grep_glob])
             others = [ln for ln in out.stdout.splitlines()
-                      if not ln.startswith(f"{current}:") and not _dup_skipped(ln.split(":", 1)[0])]
+                      if not ln.startswith(f"{current}:") and not _is_test_path(ln.split(":", 1)[0])]
             if others:
                 where = ", ".join(":".join(o.split(":", 2)[:2]) for o in others[:3])
                 hits.add("DUP-NAME", current, _def_line(current, name), f"`{name}` is already defined at {where}")
@@ -1267,7 +1331,7 @@ def _dup_existing(hits: Hits, added: dict[str, dict[int, str]]) -> str | None:
             for hit in out.stdout.splitlines():
                 path, ln, _ = hit.split(":", 2)
                 ln_no = int(ln)
-                if _dup_skipped(path) or (path in added and ln_no in added[path]):
+                if _is_test_path(path) or (path in added and ln_no in added[path]):
                     continue  # the hit is this change's own added code
                 try:
                     other = Path(path).read_text(errors="replace").splitlines()
@@ -1299,6 +1363,11 @@ def main() -> int:
     ap.add_argument("--worktree", action="store_true")
     ap.add_argument("--base")
     ap.add_argument(
+        "--caller-depth",
+        type=int,
+        help="2 also lists each caller's callers in UNITS (round-2 deep pass); default from patterns.toml",
+    )
+    ap.add_argument(
         "--linter",
         action="store_true",
         help="Force all linters, including local-only ones (eslint), even if not auto-detected.",
@@ -1306,6 +1375,8 @@ def main() -> int:
     args = ap.parse_args()
 
     langs, manual_categories, unit_cfg, jedi_cfg = load_config()
+    if args.caller_depth:
+        unit_cfg.caller_depth = args.caller_depth
     jr = JediRefs(jedi_cfg)
 
     mode, base = pick_mode(args)
