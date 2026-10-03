@@ -89,6 +89,19 @@ deterministically:
   → APPROVE**, overridable via `--event` (also a judgement call). A clean PR is
   **not** auto-approved (console only), so the tool never self-approves its
   author's PR.
+- **Pin the reviewed head** (`--commit`): if the author pushed while the review ran,
+  the findings' line numbers point at other code, and a moved line often still sits
+  inside some hunk, so the anchor check alone cannot notice. The script refuses to
+  post in that case and posts the review against that exact `commit_id` otherwise.
+- **Own PR:** GitHub rejects REQUEST_CHANGES on your own PR with a 422, which used to
+  sink the batch and scatter the findings as loose comments. The event is lowered to
+  COMMENT instead.
+- **Nothing lost to anchoring:** findings that could not be anchored inline are
+  written into the review body, not just counted.
+- **Re-review state:** the review body carries a hidden marker with the reviewed head
+  and each finding's fingerprint (path + category + title), and every inline comment
+  carries its fingerprint. The next round diffs only `sha..HEAD` and gives a verdict on
+  each earlier finding instead of rediscovering it.
 - On batch failure, **fall back to per-comment posting** so one bad anchor can't
   sink the rest. `scripts/setup_check.py` verifies `gh`/auth/repo-access first, and
   `tests/` cover the deterministic core.
@@ -192,6 +205,16 @@ Python 유닛은 그대로 나온다.
 - event 기본 결정: **CRITICAL/HIGH → REQUEST_CHANGES, 그 외 → COMMENT, 없음 → APPROVE**,
   이것도 판단이라 `--event`로 오버라이드 가능. 깨끗한 PR은 **자동 승인하지 않고**(콘솔만)
   — 그래서 자기 PR을 self-approve하지 않는다.
+- **리뷰한 head를 고정한다**(`--commit`). 리뷰 도중 작성자가 push하면 findings의 줄 번호가
+  다른 코드를 가리키는데, 옮겨진 줄도 대개 어느 hunk 안에 있어서 앵커 검사만으로는 알아채지
+  못한다. 그래서 head가 바뀌었으면 게시를 거부하고, 아니면 그 `commit_id`에 고정해 게시한다.
+- **자기 PR:** GitHub은 자기 PR의 REQUEST_CHANGES를 422로 거부한다. 예전에는 이 때문에 배치가
+  실패해 지적이 낱개 코멘트로 흩어졌다. 이제 event를 COMMENT로 낮춘다.
+- **앵커 실패도 잃지 않는다:** 인라인으로 달지 못한 finding은 집계 숫자가 아니라 내용째
+  리뷰 본문에 싣는다.
+- **재리뷰 상태:** 리뷰 본문에 리뷰한 head와 finding fingerprint(path+category+title)를
+  숨김 마커로 남기고, 인라인 코멘트마다 fingerprint를 붙인다. 다음 라운드는 `sha..HEAD`만
+  보고 이전 지적마다 판정을 내린다 — 같은 걸 다시 찾지 않는다.
 - 배치 실패 시 **개별 코멘트 폴백**으로 앵커 하나가 나머지를 죽이지 않게 한다.
   `scripts/setup_check.py`가 `gh`/인증/repo 접근을 선검사하고, `tests/`가 결정적 코어를 커버한다.
 

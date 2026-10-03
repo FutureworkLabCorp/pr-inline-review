@@ -26,10 +26,11 @@ description: >
 | PR 번호/URL | `634`, `https://github.com/.../pull/634` | 없으면 로컬 브랜치 리뷰(항상 dry-run) |
 | 저장소 | `FutureworkLabCorp/linkBrain-server` | 없으면 git remote 자동 탐지 |
 | dry-run | `--dry-run`, `dry-run`, `콘솔`, `출력만`, `게시하지`, `테스트` | 게시 skip |
-| fresh | `--fresh`, `fresh`, `기존 무시`, `skip-existing` | Step 1(기존 리뷰 조회) skip |
+| fresh | `--fresh`, `fresh`, `기존 무시`, `skip-existing` | Step 1(기존 리뷰 조회)·재리뷰 모드 skip, 전체를 처음부터 |
 
 - **리뷰 깊이를 고르는 모드는 없다.** 항상 로컬 소스 열람 + call-site 역추적 + 테스트 갭까지 정밀 분석한다. `--dry-run`·`--fresh`는 깊이가 아니라 게시/중복처리 스위치일 뿐이다.
 - PR 번호가 없으면 → 로컬 리뷰, **무조건 dry-run**.
+- 이 스킬의 이전 리뷰가 PR에 있으면(Step 1에서 상태 마커 발견) **재리뷰 모드**로 자동 전환된다(Step 1-R). `--fresh`면 전환하지 않는다.
 
 ---
 
@@ -89,15 +90,38 @@ Python, FastAPI, LangGraph, LangChain, PostgreSQL, SQLAlchemy, Alembic, Neo4j, R
 **클라우드 에이전트보다 유리한 첫 번째 이유: 이미 논의된 걸 다시 지적하지 않는다.**
 
 ```bash
-gh pr view <PR> --repo <REPO> --json number,title,body,baseRefName,headRefName
-gh api repos/<REPO>/pulls/<PR>/reviews --jq '.[] | "\(.user.login) \(.state): \(.body[0:200])"'
-gh api "repos/<REPO>/pulls/<PR>/comments?sort=created&direction=desc&per_page=30" \
-  --jq '.[] | "\(.path):\(.line) @\(.user.login) [+1=\(.reactions["+1"]) -1=\(.reactions["-1"])] \(.body[0:160])"'
-gh api repos/<REPO>/issues/<PR>/comments --jq '.[] | "@\(.user.login): \(.body[0:240])"'
+gh pr view <PR> --repo <REPO> --json number,title,body,baseRefName,headRefName,isDraft,state
+gh api --paginate repos/<REPO>/pulls/<PR>/reviews --jq '.[] | "\(.id) \(.user.login) \(.state) \(.commit_id[0:12]): \(.body[0:200])"'
+gh api --paginate repos/<REPO>/issues/<PR>/comments --jq '.[] | "@\(.user.login): \(.body[0:240])"'
+```
+
+인라인 스레드는 GraphQL로 읽는다. REST `pulls/comments`에는 스레드의 resolved 여부가 없고, 답글이 따로 흩어져서 "작성자가 반박했는가"를 판단할 수 없다.
+
+```bash
+gh api graphql -F owner=<OWNER> -F name=<NAME> -F pr=<PR> -f query='
+query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
+  reviewThreads(first:100){nodes{isResolved isOutdated path line
+    comments(first:30){nodes{databaseId author{login} body reactionGroups{content reactors{totalCount}}}}}}}}}' \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | "\(if .isResolved then "RESOLVED" elif .isOutdated then "OUTDATED" else "OPEN" end) \(.path):\(.line) #\(.comments.nodes[0].databaseId) " + ([.comments.nodes[] | "@\(.author.login)\([.reactionGroups[] | select(.reactors.totalCount>0) | " [\(.content)=\(.reactors.totalCount)]"] | join("")): \(.body[0:160] | gsub("\n";" "))"] | join(" / "))'
 ```
 
 판단:
-- 👎 반응 / PR author 반박 / resolved / 동일 파일·줄 동일 지적 → **해당 이슈 제외**.
+- 👎(`THUMBS_DOWN`) 반응 / PR author 반박 / RESOLVED / 동일 파일·줄 동일 지적 → **해당 이슈 제외**.
+- 반박은 받아쓰지 않는다. 반박이 코드로 반증되면 같은 지적을 다시 올리지 말고 그 스레드에 근거(`file:line`)를 들어 답한다.
+- PR이 draft·closed면 리뷰 전에 사용자에게 계속할지 확인한다.
+- 리뷰 본문에 `<!-- pr-inline-review:v1 {...} -->` 마커가 있으면 → **Step 1-R(재리뷰)**.
+
+---
+
+## Step 1-R. 재리뷰 (이전 라운드의 상태 마커가 있을 때)
+
+이 스킬이 게시한 리뷰 본문에는 `review_post.py`가 숨김 마커를 남긴다: 리뷰한 head SHA와 각 finding의 fingerprint(path+category+title 해시). 인라인 코멘트마다 `<!-- pr-inline-review:fp=... -->`가 붙어 있어 스레드와 finding을 짝지을 수 있다. 가장 최근 마커를 기준으로:
+
+1. **증분 diff:** `git fetch origin <PR_HEAD> -q && git diff <marker.sha> FETCH_HEAD`. `marker.sha`가 head의 조상이 아니면(force-push·rebase) 증분은 믿을 수 없다 — 전체 리뷰로 돌아가고 그 사실을 `_summary`에 적는다.
+2. **이전 finding마다 판정** (빠짐없이): `fixed`(코드로 확인, 고친 커밋 명시) / `open`(그대로) / `rebutted-accepted`(작성자 반박이 맞음) / `rebutted-rejected`(반박이 틀림, 근거 제시) / `outdated`(코드가 사라져 판정 불가). 작성자의 "Addressed in <sha>" 답글은 주장일 뿐이다 — 그 커밋의 코드를 읽고 판정한다.
+3. **스레드 답글:** `fixed`·`rebutted-*`는 해당 스레드에 한두 문장으로 답한다(`gh api repos/<REPO>/pulls/<PR>/comments/<첫 코멘트 databaseId>/replies -f body=...`). 같은 지적을 새 코멘트로 다시 달지 않는다.
+4. **새 finding은 증분 diff에서만** 찾는다(Step 3-A 스윕도 `--base <marker.sha>`). 2라운드부터는 증분이 새로 만든 문제가 아니면 MEDIUM 미만의 새 지적을 올리지 않는다 — 라운드마다 nit이 새로 생기면 리뷰가 수렴하지 않는다.
+5. `_summary`는 이전 finding 판정표로 시작한다(`| finding | 판정 | 근거 커밋 |`).
 
 ---
 
@@ -105,7 +129,10 @@ gh api repos/<REPO>/issues/<PR>/comments --jq '.[] | "@\(.user.login): \(.body[0
 
 ```bash
 gh pr diff <PR> --repo <REPO>
+HEAD_SHA=$(gh api repos/<REPO>/pulls/<PR> --jq .head.sha)   # Step 7의 --commit 값
 ```
+
+`HEAD_SHA`는 이번 리뷰가 읽은 코드의 기준점이다. 리뷰 도중 작성자가 push하면 findings의 줄 번호가 다른 코드를 가리키게 되므로, 게시 스크립트가 이 값과 현재 head를 대조해 어긋나면 게시를 거부한다.
 
 `+` 줄에만 집중한다. `-` 줄은 리포트하지 않는다.
 > 좌표(line/side/position)는 절대 손으로 세지 않는다 — findings에는 **new-file 줄 번호만** 적고, 나머지는 `review_post.py`가 계산한다.
@@ -187,6 +214,22 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 
 설계 판단이 걸리는 finding(DB 모델 선택, hook vs transaction, ACL 위치, RAG lifecycle, state machine 등)은 `$SKILL_DIR/reference/patterns.md`의 해당 §를 근거로 삼는다.
 
+### 올리는 기준 (전부 만족해야 finding)
+1. **이 PR이 만든 문제다.** 기존 결함은 아래 "기존 결함"으로 따로 다룬다.
+2. **영향받는 코드를 짚을 수 있다.** "다른 곳이 깨질 수도"는 근거가 아니다 — 깨지는 호출부를 `file:line`으로 댄다.
+3. **실패 시나리오를 먼저 말할 수 있다.** 어떤 입력·상태에서 무엇이 잘못되는지. `explanation`의 첫 문장이 그 시나리오다. 특정 입력에서만 생기면 그 조건과, 심각도가 거기에 달렸다는 점을 적는다.
+4. **작성자가 알았다면 고쳤을 문제다.** 의도된 동작 변경(PR 설명·커밋 메시지에 적힌 것)은 결함이 아니다.
+
+### 올리지 않는 것
+- ruff·mypy·eslint가 잡는 것 (스윕의 린트 레인 HIT는 예외 — 판정 대상).
+- 코드에서 명시적으로 침묵시킨 규칙(`# noqa: X — 이유`, `# type: ignore[...]`)과 그 이유가 타당한 경우.
+- diff 밖에 정의된 import·심볼의 존재를 의심하는 것 — 확인하고 말하거나 말하지 않는다.
+- docstring·타입 힌트·주석 누락, "더 구체적인 예외 타입을 쓰라", 취향 차이의 리네이밍.
+- 보안 판례: 환경변수·CLI 인자·설정 파일 값은 신뢰 입력이다. UUID는 추측 불가로 본다. 리소스 누수는 보안 취약점이 아니라 lifecycle 문제다(category를 맞게). URL을 로그에 남기는 것은 괜찮고, 비밀값·개인정보를 남기는 것은 finding이다.
+
+### 기존 결함 (이 PR이 만들지 않은 진짜 버그)
+버리지 않는다. 인라인으로 달지 않고 event에도 반영하지 않으며, `_summary`의 "기존 결함" 소절에 `file:line`과 한 줄 설명으로 남긴다. 이 PR의 새 코드가 그 결함에 의존하거나 결함을 악화시키면 그때는 이 PR의 finding이다.
+
 ### 보고 전 자기검증 (반드시)
 - 이미 코드에서 처리됐나? (exists 체크·fallback·str() 변환 등)
 - 이 경로가 실제 실행 가능한가?
@@ -223,6 +266,7 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 - **side 선택:** `+`/컨텍스트 줄만이면 RIGHT(기본). `-`줄만 있는 위치에는 suggestion 불가(이미 삭제된 줄 — `explanation`으로 서술, 스크립트가 경고). `-`/`+` 혼합 블록 전체 교체는 `start_side: "LEFT"`(old 줄 번호) + `side: "RIGHT"`(new 줄 번호)로 가능.
 - suggestion 각 줄의 **들여쓰기는 실제 파일과 정확히 일치**시킨다 (스크립트가 첫 줄 들여쓰기 불일치를 경고로 잡아준다).
 - 설계 변경이 필요해 one-click suggestion이 불가능하면 `suggestion`을 빼고 `explanation`에 방향만 서술.
+- **suggestion은 Apply 한 번으로 문제가 완전히 해결될 때만** 단다. 6줄을 넘거나 여러 곳을 같이 고쳐야 하면 suggestion 대신 설명으로 쓴다 — 절반만 고치는 Apply 버튼은 "고쳤다"는 착각을 만든다.
 - **위키 인용은 `[[Page]]` / `[[라벨|Page]]` 로 쓴다.** GitHub 은 이 문법을 위키 안에서만 해석해서 PR 코멘트에는 그냥 글자로 남는데, `review_post.py` 가 게시 전에 `https://github.com/OWNER/REPO/wiki/Page` 로 펴 준다. `#앵커`도 따라간다. 코드 펜스와 인라인 코드 안은 건드리지 않으니 이 문법 자체를 설명할 때도 안전하다. 로컬에 `wiki/` 클론이 있으면 없는 페이지를 경고로 알려준다(링크는 그대로 붙는다).
 - `category`: security | bug | regression | lifecycle | type-safety | extensibility | pattern | style
 
@@ -236,12 +280,28 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 
 각 후보에 대해 아래를 실제 코드(Step 3에서 읽은 소스·호출부)와 대조해 판정한다:
 
-1. **진짜 버그인가?** — 주장한 실패 시나리오가 실제로 성립하는가. 구체적 입력/상태 → 잘못된 출력/크래시로 이어지는 경로를 댈 수 있나. 못 대면 → **드롭**.
+1. **진짜 버그인가?** — 주장한 실패 시나리오가 실제로 성립하는가. 구체적 입력/상태 → 잘못된 출력/크래시로 이어지는 경로를 댈 수 있나. 시나리오 자체를 못 대면 후보가 아니다 → **드롭**. (시나리오는 있는데 가드 유무를 증명·반증 못 한 경우는 드롭이 아니라 6-2의 "확인 불가"다.)
 2. **이미 처리됐나?** — 상위/하위에 exists 체크·fallback·try/except·타입 변환·기본값이 이미 있나. 있으면 → **드롭**.
 3. **실행 경로가 도달 가능한가?** — dead code·불가능한 분기·호출되지 않는 함수면 → **드롭 또는 LOW 강등**.
 4. **이미 논의됐나?** — Step 1의 기존 코멘트/반응과 중복이면 → **드롭**.
 5. **근거 있는 심각도인가?** — 정확성/보안/생명주기 근거 없이 취향·스타일이면 → **LOW 강등 또는 드롭**. (AGENTS.md: 근거 없는 동의·지적 금지)
 6. **suggestion이 실제로 맞나?** — 제안 코드가 컴파일/동작하고 주변 들여쓰기·시그니처와 일치하나. 어긋나면 → suggestion 제거하고 `explanation`만 남김.
+
+### 6-1. 독립 검증 (CRITICAL / HIGH / category=security는 필수)
+
+위 1~6은 같은 맥락에서 자기 결론을 다시 보는 것이라 확증 편향을 피하기 어렵다. 그래서 심각도 높은 후보는 **맥락을 공유하지 않는 검증 서브에이전트**(Agent 도구, 후보마다 하나, 여러 건이면 한 메시지에서 병렬)에 넘긴다. 넘기는 것은:
+- PR 의도 한두 문장, 후보의 주장(실패 시나리오), 관련 파일 경로와 줄 범위, 리뷰 대상 트리 경로(same-branch면 저장소, 아니면 `$WT`).
+- 넘기지 않는 것: 내 추론 과정, 내가 확신하는 이유. 검증자가 결론에 끌려가지 않게 하려는 것이다.
+
+검증자에게 요구하는 출력: `CONFIRMED` / `REFUTED` / `UNVERIFIABLE` 중 하나와, 그 판정을 받치는 **소스의 `file:line` 인용**(이름에서 추론한 동작은 근거가 아니다). 검증자는 읽기만 하고 다른 서브에이전트를 띄우지 않는다.
+
+### 6-2. 판정 반영
+
+| 판정 | 처리 |
+|------|------|
+| 확인됨 (`CONFIRMED`, 또는 MEDIUM 이하에서 1~6 통과) | `findings.json`에 남긴다. |
+| 반증됨 — 가드가 있거나 도달 불가함을 **코드로 보였다** | 드롭. 반증 없이 의심만으로는 드롭하지 않는다. |
+| 확인 불가 — 그럴듯하지만 증명도 반증도 못 했다 | 인라인으로 달지 않는다. `_summary`의 "미확인 후보" 소절에 `file:line`, 주장, **무엇을 확인하면 판가름 나는지**를 남긴다. 조용히 지우지 않는다. |
 
 **살아남은 항목만** 최종 `findings.json`으로 파일에 쓴다. 이게 모델의 유일한 산출물이다.
 - 전부 드롭돼도 정상이다 — 지적할 게 없으면 빈 리스트(+`_summary`)로 둔다. 스크립트는 `APPROVE`로 판정하되 **자기 PR을 자동 승인하지 않도록** 게시는 생략하고 콘솔에만 출력한다.
@@ -255,17 +315,21 @@ findings를 파일로 저장한 뒤:
 
 ```bash
 # dry-run (콘솔만, 게시 안 함)
-python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json --dry-run
+python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json --dry-run
 
 # 실제 게시
-python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json
+python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json
 ```
 
 스크립트가 하는 일 (모델은 관여하지 않음):
+- **게시 전 확인:** PR head가 `--commit`과 다르면(리뷰 중 push) 게시를 거부한다(exit 3, dry-run은 경고). 이때는 새 head로 Step 2부터 다시 한다 — 증분이면 Step 1-R 방식으로. PR이 OPEN이 아니어도 거부한다. 리뷰는 그 커밋(`commit_id`)에 고정해 게시한다.
 - diff를 파싱해 각 finding의 `line/side/start_line`을 **검증** → diff 밖이면 **±10줄 이내만** 최근접 줄로 스냅, 그보다 멀면 skip (어디에 달지는 모델의 판단이므로 스크립트가 임의 이동하지 않는다 — skip 사유를 보고 모델이 재앵커).
 - `_summary`·`title`·`explanation` 의 `[[Page]]` 를 위키 URL 로 변환(`--no-wiki-links` 로 끄고, 위키가 딴 데 있으면 `--wiki-base`).
 - 심각도 SVG 배지(Gemini식 `![HIGH](...gstatic...)`) + `**[SEV] category** — title` 접두어와 ` ```suggestion ` 펜스를 자동 부착. 리뷰 본문 = 모델의 `_summary` markdown + 스크립트의 심각도 집계표.
 - event 기본 결정: **CRITICAL/HIGH 있으면 REQUEST_CHANGES / MEDIUM·LOW만 COMMENT / 없으면 APPROVE**. 이것도 판단이므로 `--event REQUEST_CHANGES|COMMENT`로 오버라이드 가능(APPROVE는 게시 자체가 불가 — self-approve 방지).
+- **자기 PR이면** REQUEST_CHANGES를 COMMENT로 바꾼다. GitHub이 자기 PR의 REQUEST_CHANGES를 422로 거부하기 때문이다(예전에는 이 때문에 배치가 실패해 코멘트가 낱개로 흩어졌다). 머지 차단 의도는 `_summary` 첫 줄에 적는다.
+- 인라인으로 달지 못한(skip된) finding은 리뷰 본문 "인라인에 달지 못한 지적" 소절에 내용째 싣는다 — 집계표 숫자로만 남지 않는다.
+- 리뷰 본문 끝에 상태 마커(리뷰한 head SHA + finding fingerprint 목록)를, 인라인 코멘트마다 fingerprint 마커를 숨겨 붙인다. 다음 라운드의 Step 1-R이 이것을 읽는다.
 - **line 기반 단일 배치**로 `/pulls/{pr}/reviews`에 1회 게시 (position 안 씀).
 - 배치 실패 시 **개별 코멘트 폴백** — 앵커 하나가 깨져도 나머지는 살린다.
 - 앵커 가능한 코멘트가 하나도 없어도 **요약 리뷰만 게시**해 verdict를 보존한다 — findings가 전부 skip된 경우든, 지적 없이 `_summary`만 남기는 경우든. 막히는 건 APPROVE 하나뿐이고(자기 PR 자동승인 불가), findings가 없으면 그게 기본 event라 요약만 올리려면 `--event COMMENT`를 명시해야 한다. dry-run도 같은 판정을 출력하므로, 게시될지 여부를 미리 볼 수 있다.
@@ -288,10 +352,12 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --findings findings.json
 ## 요약 흐름
 
 ```
-setup_check → 가이드 로드 → (기존 리뷰 읽기) → diff 수집
+setup_check → 가이드 로드(base 판본) → (기존 리뷰·스레드 읽기 → 마커 있으면 재리뷰 1-R)
+   → diff 수집 + HEAD_SHA 고정
    → sweep.py(HITS/MANUAL 후보 + UNITS 읽기 바닥선) → 소스 정밀 분석 → findings 초안
-   → ★검증 게이트(false-positive 제거)★ → 최종 findings.json
-   → review_post.py --dry-run 로 검증 → 이상 없으면 게시
+   → ★검증 게이트: 자기검증 + HIGH 이상은 독립 검증 서브에이전트★
+   → 확인됨=findings.json / 미확인·기존 결함·커버리지=_summary
+   → review_post.py --commit $HEAD_SHA --dry-run 로 검증 → 이상 없으면 게시
    → (different-branch) worktree 유지, 삭제 여부는 사용자에게 확인
 ```
 

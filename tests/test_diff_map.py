@@ -230,6 +230,56 @@ def test_summary_body_is_model_markdown_plus_table():
 
 
 # --------------------------------------------------------------------------- #
+# review state and posting guards
+# --------------------------------------------------------------------------- #
+
+def test_fingerprint_ignores_line_and_whitespace():
+    a = {"path": "x.py", "line": 10, "category": "bug", "title": "Lost  UUID"}
+    b = {"path": "x.py", "line": 42, "category": "BUG", "title": "lost uuid "}
+    assert R.fingerprint(a) == R.fingerprint(b)
+    assert R.fingerprint(a) != R.fingerprint({**a, "path": "y.py"})
+
+
+def test_inline_comment_carries_fingerprint():
+    dm = R.parse_diff(DIFF)
+    f = {"path": "src/app/core/worker.py", "line": 196, "severity": "LOW",
+         "title": "a"}
+    payload, _, _ = R.build_review_payload([f], dm, "s")
+    assert R.parse_fingerprint_marker(payload["comments"][0]["body"]) == R.fingerprint(f)
+
+
+def test_state_marker_round_trips_through_summary_body():
+    import review_post as P
+    findings = [{"path": "x.py", "category": "bug", "title": "t", "severity": "HIGH"}]
+    body = P.summary_body(findings, "prose", head_sha="abc123")
+    state = R.parse_state_marker(body)
+    assert state == {"sha": "abc123", "findings": [R.fingerprint(findings[0])]}
+    assert R.parse_state_marker("no marker here") is None
+
+
+def test_summary_body_lists_skipped_findings():
+    import review_post as P
+    skipped = [{"path": "a.py", "line": 7, "severity": "HIGH", "title": "far anchor",
+                "explanation": "why", "_reason": "not in diff"}]
+    body = P.summary_body(skipped, "", skipped)
+    assert "`a.py:7`" in body and "far anchor" in body and "why" in body
+
+
+def test_own_pr_downgrades_request_changes_only():
+    assert R.event_for_author("REQUEST_CHANGES", own_pr=True)[0] == "COMMENT"
+    assert R.event_for_author("REQUEST_CHANGES", own_pr=False) == ("REQUEST_CHANGES", None)
+    assert R.event_for_author("COMMENT", own_pr=True) == ("COMMENT", None)
+
+
+def test_check_head_refuses_moved_head():
+    import review_post as P
+    meta = {"headRefOid": "deadbeef" * 5}
+    assert P.check_head(meta, "deadbeef") is None          # short sha prefix
+    assert P.check_head(meta, None) is None                # not pinned: no check
+    assert "다름" in P.check_head(meta, "cafebabe")
+
+
+# --------------------------------------------------------------------------- #
 # bare-python runner
 # --------------------------------------------------------------------------- #
 

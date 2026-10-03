@@ -10,6 +10,7 @@ mechanical, error-prone step deterministically:
 Usage:
   python review_post.py --repo OWNER/REPO --pr 634 --findings findings.json
   python review_post.py --repo OWNER/REPO --pr 634 --findings findings.json --dry-run
+  python review_post.py --pr 634 --commit <reviewed head sha> --findings findings.json
   python review_post.py --pr 634 --findings findings.json          # repo auto-detected
   cat findings.json | python review_post.py --repo OWNER/REPO --pr 634 --findings -
 
@@ -84,9 +85,44 @@ def fetch_diff(repo: str, pr: int) -> str:
     return _run(["gh", "pr", "diff", str(pr), "--repo", repo]).stdout
 
 
-def fetch_head_sha(repo: str, pr: int) -> str:
-    return _run(["gh", "pr", "view", str(pr), "--repo", repo,
-                 "--json", "commits", "--jq", ".commits[-1].oid"]).stdout.strip()
+def fetch_pr_meta(repo: str, pr: int) -> dict:
+    """Head sha, state and author in one call, plus the login that will post."""
+    # REST rather than `gh pr view --json`: older gh builds lack headRefOid there.
+    pr_json = json.loads(_run(["gh", "api", f"repos/{repo}/pulls/{pr}"]).stdout)
+    p = _run(["gh", "api", "user", "--jq", ".login"], check=False)
+    return {
+        "headRefOid": pr_json["head"]["sha"],
+        "state": str(pr_json.get("state", "")).upper(),
+        "isDraft": pr_json.get("draft", False),
+        "author": {"login": (pr_json.get("user") or {}).get("login")},
+        "viewer": p.stdout.strip() if p.returncode == 0 else None,
+    }
+
+
+def check_head(meta: dict, commit: str | None) -> str | None:
+    """Why the findings no longer match the PR head, or None if they still do.
+
+    Findings carry line numbers read from the head the review ran on. If the author
+    pushed since, the same numbers point at other code, and the diff check alone
+    cannot tell: a moved line is often still inside some hunk.
+    """
+    head = meta.get("headRefOid") or ""
+    if commit is None:
+        return None
+    if not head.startswith(commit):
+        return (f"PR head가 리뷰한 커밋과 다름: reviewed={commit[:12]} "
+                f"head={head[:12]} — 새 head로 스윕·검증을 다시 돌릴 것")
+    return None
+
+
+def post_summary_review(repo: str, pr: int, body: str, event: str,
+                        head_sha: str) -> bool:
+    p = _run(["gh", "api", f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
+              "--field", f"body={body}", "--field", f"event={event}",
+              "--field", f"commit_id={head_sha}"], check=False)
+    if p.returncode != 0:
+        print(f"요약 리뷰 게시 실패 (event={event}): {p.stderr.strip()[:200]}")
+    return p.returncode == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -157,12 +193,17 @@ def expand_wiki_links_in(findings: list, model_summary: str, base: str,
 SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
 
 
-def summary_body(findings: list, model_summary: str) -> str:
+def summary_body(findings: list, model_summary: str, skipped: list = (),
+                 head_sha: str | None = None) -> str:
     """Deterministic part of the review body: heading + severity count table.
 
     Everything judgement-flavoured — verdict prose, per-file overview, analysis
     scope, non-blocking remarks — is the model's job and arrives as free
     markdown in the findings `_summary` entry.
+
+    Findings that could not be anchored inline are listed here, so a skipped HIGH
+    is still readable on the PR rather than only counted. With `head_sha`, a hidden
+    state marker records the reviewed head and the findings for the next round.
     """
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for f in findings:
@@ -175,6 +216,17 @@ def summary_body(findings: list, model_summary: str) -> str:
     lines += ["| 심각도 | 건수 |", "|--------|------|"]
     for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
         lines.append(f"| {SEV_ICON[s]} {s} | {counts[s]} |")
+    if skipped:
+        lines += ["", "### 인라인에 달지 못한 지적", ""]
+        for f in skipped:
+            sev = str(f.get("severity", "MEDIUM")).upper()
+            lines.append(f"- **[{sev}]** `{f.get('path')}:{f.get('line')}` — "
+                         f"{f.get('title', '').strip()}")
+            expl = (f.get("explanation") or "").strip()
+            if expl:
+                lines += ["", "  " + expl.replace("\n", "\n  "), ""]
+    if head_sha:
+        lines += ["", R.state_marker(head_sha, findings)]
     return "\n".join(lines)
 
 
@@ -225,6 +277,36 @@ def print_console(payload: dict, skipped: list, warns: list, dry: bool,
 # main
 # --------------------------------------------------------------------------- #
 
+def plan_review(repo: str, pr: int, findings: list, model_summary: str,
+                event: str | None, commit: str | None) -> tuple:
+    """Build the payload against the live PR. Returns (payload, skipped, warns, blockers).
+
+    `blockers` are reasons not to post at all: the head moved past the reviewed
+    commit, or the PR is no longer open. A dry run prints them as warnings.
+    """
+    meta = fetch_pr_meta(repo, pr)
+    head = meta.get("headRefOid", "")
+    blockers = []
+    moved = check_head(meta, commit)
+    if moved:
+        blockers.append(moved)
+    if meta.get("state") != "OPEN":
+        blockers.append(f"PR 상태가 {meta.get('state')} — 게시하지 않음")
+    if commit is None:
+        print("경고: --commit 없음 — 리뷰 중 push가 있었다면 줄 번호가 어긋날 수 있음")
+
+    diffmap = R.parse_diff(fetch_diff(repo, pr))
+    payload, skipped, warns = R.build_review_payload(findings, diffmap, "", event=event)
+    own = bool(meta.get("viewer")) and \
+        meta.get("viewer") == (meta.get("author") or {}).get("login")
+    payload["event"], note = R.event_for_author(payload["event"], own)
+    if note:
+        print(note)
+    payload["commit_id"] = head
+    payload["body"] = summary_body(findings, model_summary, skipped, head)
+    return payload, skipped, warns, blockers
+
+
 def load_findings(path: str) -> tuple:
     raw = sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()
     data = json.loads(raw)
@@ -251,6 +333,9 @@ def main(argv=None):
                          "(default https://github.com/OWNER/REPO/wiki/)")
     ap.add_argument("--no-wiki-links", action="store_true",
                     help="leave [[Page]] literal instead of linking it")
+    ap.add_argument("--commit",
+                    help="head sha the findings were read from; posting is refused "
+                         "if the PR head has moved since (recommended)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -286,11 +371,14 @@ def main(argv=None):
             sys.stderr.write(f"  경고(위키 링크): {w}\n")
         return 0
 
-    diff = fetch_diff(repo, args.pr)
-    diffmap = R.parse_diff(diff)
-    body = summary_body(findings, model_summary)
-    payload, skipped, warns = R.build_review_payload(
-        findings, diffmap, body, event=args.event)
+    payload, skipped, warns, blockers = plan_review(
+        repo, args.pr, findings, model_summary, args.event, args.commit)
+    head, body = payload["commit_id"], payload["body"]
+
+    for b in blockers:
+        print(f"{'경고' if dry else '중단'}: {b}")
+    if blockers and not dry:
+        return 3
 
     if dry:
         print_console(payload, skipped, warns, dry=True, wiki_warns=wiki_warns)
@@ -304,11 +392,9 @@ def main(argv=None):
         # nobody else reads. `summary_only_plan` decides, and the dry run above printed
         # the same decision.
         post, reason = summary_only_plan(payload["event"], findings, model_summary)
-        if post:
-            _run(["gh", "api", f"repos/{repo}/pulls/{args.pr}/reviews",
-                  "--method", "POST", "--field", f"body={body}",
-                  "--field", f"event={payload['event']}"], check=False)
         print(reason)
+        if post and not post_summary_review(repo, args.pr, body, payload["event"], head):
+            return 1
         print_console(payload, skipped, warns, dry=False, wiki_warns=wiki_warns)
         return 0
 
@@ -322,21 +408,23 @@ def main(argv=None):
     # batch failed (often a single bad anchor). Fall back to per-comment posting
     # so the good comments still land, and report which one broke.
     print(f"배치 게시 실패, 개별 폴백 시도: {res['stderr'].strip()[:200]}")
-    head = fetch_head_sha(repo, args.pr)
+    return post_fallback(repo, args.pr, payload, len(skipped))
+
+
+def post_fallback(repo: str, pr: int, payload: dict, n_skipped: int) -> int:
+    head = payload["commit_id"]
     ok = bad = 0
     for c in payload["comments"]:
-        r = post_single_comment(repo, args.pr, head, c)
+        r = post_single_comment(repo, pr, head, c)
         if r["ok"]:
             ok += 1
         else:
             bad += 1
             print(f"  실패 {c['path']}:{c['line']} — {r['stderr'].strip()[:160]}")
     # a summary review comment (no inline) so the event still registers
-    _run(["gh", "api", f"repos/{repo}/pulls/{args.pr}/reviews", "--method", "POST",
-          "--field", f"body={body}", "--field", f"event={payload['event']}"],
-         check=False)
-    print(f"개별 게시: 성공 {ok} / 실패 {bad} / skip {len(skipped)}")
-    return 0 if bad == 0 else 1
+    summary_ok = post_summary_review(repo, pr, payload["body"], payload["event"], head)
+    print(f"개별 게시: 성공 {ok} / 실패 {bad} / skip {n_skipped}")
+    return 0 if bad == 0 and summary_ok else 1
 
 
 if __name__ == "__main__":

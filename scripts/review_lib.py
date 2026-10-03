@@ -11,6 +11,10 @@ Responsibilities (all pure functions, no network, no file I/O):
   4. build_review_payload()  findings + diff -> GitHub reviews API payload (+ skipped)
   5. expand_wiki_links()     [[Page]] -> a real wiki URL (GitHub only resolves the
                              double-bracket form inside a wiki, not in a PR comment)
+  6. state_marker() / parse_state_marker() / fingerprint()
+                             hidden review state, so a re-review knows which head it
+                             saw and which findings it raised
+  7. event_for_author()      GitHub rejects REQUEST_CHANGES on your own PR
 
 The GitHub "Create a review" API accepts line-based coordinates
 (path, line, side, start_line, start_side) inside comments[], so a single
@@ -20,6 +24,8 @@ No `position` arithmetic anywhere — that was the old failure source.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import urllib.parse
 from dataclasses import dataclass, field
@@ -386,6 +392,7 @@ def build_review_payload(findings: list, diffmap: dict, summary_body: str,
         # so collect warnings AFTER it runs (and keep them out of the posted body).
         body = build_comment_body(f, fd, anchor)
         all_warnings.extend(anchor.warnings)
+        body += "\n\n" + fingerprint_marker(f)
         comments.append({**anchor.to_comment_fields(), "body": body})
 
     # Event reflects the full verdict: a CRITICAL/HIGH still requests changes even
@@ -396,3 +403,66 @@ def build_review_payload(findings: list, diffmap: dict, summary_body: str,
         "comments": comments,
     }
     return payload, skipped, all_warnings
+
+
+# --------------------------------------------------------------------------- #
+# review state and posting guards
+# --------------------------------------------------------------------------- #
+
+_STATE_RE = re.compile(r"<!-- pr-inline-review:v1 (\{.*?\}) -->")
+_FP_RE = re.compile(r"<!-- pr-inline-review:fp=([0-9a-f]{12}) -->")
+
+
+def fingerprint(finding: dict) -> str:
+    """Stable id of a finding across review rounds.
+
+    Line numbers are left out on purpose: they move with every push, while
+    path + category + title survive one. A retitled finding gets a new id, which
+    only costs the re-review a manual match, never a wrong one.
+    """
+    title = " ".join(str(finding.get("title", "")).lower().split())
+    key = "\x1f".join([str(finding.get("path", "")),
+                       str(finding.get("category", "")).lower(), title])
+    return hashlib.sha1(key.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+
+def fingerprint_marker(finding: dict) -> str:
+    return f"<!-- pr-inline-review:fp={fingerprint(finding)} -->"
+
+
+def parse_fingerprint_marker(body: str) -> Optional[str]:
+    m = _FP_RE.search(body or "")
+    return m.group(1) if m else None
+
+
+def state_marker(head_sha: str, findings: list) -> str:
+    """Hidden line for the review body: the head this round reviewed and its findings.
+
+    The next round reads it back to diff only `sha..HEAD` and to give a verdict on
+    each earlier finding instead of rediscovering them.
+    """
+    data = {"sha": head_sha, "findings": sorted({fingerprint(f) for f in findings})}
+    return f"<!-- pr-inline-review:v1 {json.dumps(data, separators=(',', ':'))} -->"
+
+
+def parse_state_marker(body: str) -> Optional[dict]:
+    m = _STATE_RE.search(body or "")
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) and "sha" in data else None
+
+
+def event_for_author(event: str, own_pr: bool) -> tuple:
+    """Returns (event, note). GitHub answers 422 to REQUEST_CHANGES on your own PR.
+
+    Before this guard the batch failed, the fallback posted every finding as a loose
+    comment, and the closing summary review failed the same way without a word.
+    """
+    if own_pr and event == "REQUEST_CHANGES":
+        return "COMMENT", ("자기 PR이라 REQUEST_CHANGES 불가 — COMMENT로 게시 "
+                           "(머지 차단 의도는 _summary에 명시할 것)")
+    return event, None
