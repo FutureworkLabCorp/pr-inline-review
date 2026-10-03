@@ -15,6 +15,10 @@ Responsibilities (all pure functions, no network, no file I/O):
                              hidden review state, so a re-review knows which head it
                              saw and which findings it raised
   7. event_for_author()      GitHub rejects REQUEST_CHANGES on your own PR
+  8. review_round() / apply_round_policy()
+                             which round this review is, and which findings it may
+                             still post: no repeats, and a severity floor that rises
+                             with the round so a deeper review still converges
 
 The GitHub "Create a review" API accepts line-based coordinates
 (path, line, side, start_line, start_side) inside comments[], so a single
@@ -435,13 +439,15 @@ def parse_fingerprint_marker(body: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def state_marker(head_sha: str, findings: list) -> str:
+def state_marker(head_sha: str, findings: list, round_no: Optional[int] = None) -> str:
     """Hidden line for the review body: the head this round reviewed and its findings.
 
     The next round reads it back to diff only `sha..HEAD` and to give a verdict on
     each earlier finding instead of rediscovering them.
     """
-    data = {"sha": head_sha, "findings": sorted({fingerprint(f) for f in findings})}
+    data: dict = {"sha": head_sha, "findings": sorted({fingerprint(f) for f in findings})}
+    if round_no is not None:
+        data["round"] = round_no
     return f"<!-- pr-inline-review:v1 {json.dumps(data, separators=(',', ':'))} -->"
 
 
@@ -466,3 +472,54 @@ def event_for_author(event: str, own_pr: bool) -> tuple:
         return "COMMENT", ("자기 PR이라 REQUEST_CHANGES 불가 — COMMENT로 게시 "
                            "(머지 차단 의도는 _summary에 명시할 것)")
     return event, None
+
+
+# --------------------------------------------------------------------------- #
+# review rounds
+# --------------------------------------------------------------------------- #
+
+_SEV_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def review_round(markers: list) -> int:
+    """One past the rounds already on the PR.
+
+    Markers written before rounds were recorded carry no `round`, so their count
+    is the floor; a recorded round wins when it is higher (a review was redone).
+    """
+    recorded = [m.get("round") for m in markers if isinstance(m.get("round"), int)]
+    return max([len(markers)] + recorded) + 1
+
+
+def round_floor(round_no: int) -> Optional[str]:
+    """The lowest severity a NEW finding may have in this round.
+
+    Round 1 has none. Later rounds look deeper, and a deeper look always finds
+    more nits; without a rising floor the review never converges.
+    """
+    if round_no <= 1:
+        return None
+    return "MEDIUM" if round_no == 2 else "HIGH"
+
+
+def apply_round_policy(findings: list, round_no: int, prior_fps: set) -> tuple:
+    """Returns (kept, dropped), dropped as (finding, reason).
+
+    A finding already raised in an earlier round is answered in its own thread,
+    not posted again. A new finding below the round's floor is dropped unless it
+    says the increment since the last review introduced it
+    (`introduced_by_increment: true`): fresh code gets a first review at any level.
+    """
+    floor = round_floor(round_no)
+    kept, dropped = [], []
+    for f in findings:
+        if fingerprint(f) in prior_fps:
+            dropped.append((f, "an earlier round raised it; answer in that thread"))
+            continue
+        sev = str(f.get("severity", "MEDIUM")).upper()
+        if floor and _SEV_RANK.get(sev, 1) < _SEV_RANK[floor] \
+                and not f.get("introduced_by_increment"):
+            dropped.append((f, f"below the round-{round_no} floor ({floor})"))
+            continue
+        kept.append(f)
+    return kept, dropped

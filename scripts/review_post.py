@@ -11,6 +11,7 @@ Usage:
   python review_post.py --repo OWNER/REPO --pr 634 --findings findings.json
   python review_post.py --repo OWNER/REPO --pr 634 --findings findings.json --dry-run
   python review_post.py --pr 634 --commit <reviewed head sha> --findings findings.json
+  python review_post.py --pr 634 --findings findings.json --round 2   # force the round
   python review_post.py --pr 634 --findings findings.json          # repo auto-detected
   cat findings.json | python review_post.py --repo OWNER/REPO --pr 634 --findings -
 
@@ -194,7 +195,7 @@ SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
 
 
 def summary_body(findings: list, model_summary: str, skipped: list = (),
-                 head_sha: str | None = None) -> str:
+                 head_sha: str | None = None, round_no: int | None = None) -> str:
     """Deterministic part of the review body: heading + severity count table.
 
     Everything judgement-flavoured — verdict prose, per-file overview, analysis
@@ -210,7 +211,7 @@ def summary_body(findings: list, model_summary: str, skipped: list = (),
         sev = str(f.get("severity", "MEDIUM")).upper()
         # unknown severity is coerced to MEDIUM, matching build_comment_body
         counts[sev if sev in counts else "MEDIUM"] += 1
-    lines = ["## Code Review", ""]
+    lines = [f"## Code Review — {round_no}회차" if round_no and round_no > 1 else "## Code Review", ""]
     if model_summary:
         lines += [model_summary.strip(), ""]
     lines += ["| 심각도 | 건수 |", "|--------|------|"]
@@ -226,7 +227,7 @@ def summary_body(findings: list, model_summary: str, skipped: list = (),
             if expl:
                 lines += ["", "  " + expl.replace("\n", "\n  "), ""]
     if head_sha:
-        lines += ["", R.state_marker(head_sha, findings)]
+        lines += ["", R.state_marker(head_sha, findings, round_no)]
     return "\n".join(lines)
 
 
@@ -278,7 +279,8 @@ def print_console(payload: dict, skipped: list, warns: list, dry: bool,
 # --------------------------------------------------------------------------- #
 
 def plan_review(repo: str, pr: int, findings: list, model_summary: str,
-                event: str | None, commit: str | None) -> tuple:
+                event: str | None, commit: str | None,
+                round_no: int | None = None) -> tuple:
     """Build the payload against the live PR. Returns (payload, skipped, warns, blockers).
 
     `blockers` are reasons not to post at all: the head moved past the reviewed
@@ -303,8 +305,47 @@ def plan_review(repo: str, pr: int, findings: list, model_summary: str,
     if note:
         print(note)
     payload["commit_id"] = head
-    payload["body"] = summary_body(findings, model_summary, skipped, head)
+    payload["body"] = summary_body(findings, model_summary, skipped, head, round_no)
     return payload, skipped, warns, blockers
+
+
+def _json_pages(text: str) -> list:
+    """`gh api --paginate` prints one JSON array per page, back to back."""
+    out, dec, i = [], json.JSONDecoder(), 0
+    text = text.strip()
+    while i < len(text):
+        page, i = dec.raw_decode(text, i)
+        out.extend(page if isinstance(page, list) else [page])
+        while i < len(text) and text[i].isspace():
+            i += 1
+    return out
+
+
+def fetch_prior_markers(repo: str, pr: int) -> list:
+    """State markers this skill left on the PR's earlier reviews, oldest first."""
+    p = _run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{pr}/reviews"], check=False)
+    if p.returncode != 0:
+        print(f"경고: 이전 리뷰를 읽지 못함 — 1회차로 진행: {p.stderr.strip()[:160]}")
+        return []
+    markers = []
+    for review in _json_pages(p.stdout):
+        m = R.parse_state_marker(review.get("body") or "")
+        if m:
+            markers.append(m)
+    return markers
+
+
+def apply_rounds(findings: list, markers: list, forced: int | None) -> tuple:
+    """Returns (kept findings, round number), printing what the round policy dropped."""
+    round_no = forced or R.review_round(markers)
+    prior = {fp for m in markers for fp in m.get("findings", [])}
+    kept, dropped = R.apply_round_policy(findings, round_no, prior)
+    print(f"{round_no}회차 리뷰 (이전 마커 {len(markers)}개, 신규 지적 하한 "
+          f"{R.round_floor(round_no) or '없음'})")
+    for f, why in dropped:
+        print(f"  제외 [{str(f.get('severity', '?')).upper()}] "
+              f"{f.get('path')}:{f.get('line')} {f.get('title', '')} — {why}")
+    return kept, round_no
 
 
 def load_findings(path: str) -> tuple:
@@ -336,6 +377,11 @@ def main(argv=None):
     ap.add_argument("--commit",
                     help="head sha the findings were read from; posting is refused "
                          "if the PR head has moved since (recommended)")
+    ap.add_argument("--round", type=int,
+                    help="force the review round (default: one past the state markers "
+                         "already on the PR)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore earlier rounds: round 1, nothing suppressed as a repeat")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
@@ -371,8 +417,10 @@ def main(argv=None):
             sys.stderr.write(f"  경고(위키 링크): {w}\n")
         return 0
 
+    markers = [] if args.fresh else fetch_prior_markers(repo, args.pr)
+    findings, round_no = apply_rounds(findings, markers, 1 if args.fresh else args.round)
     payload, skipped, warns, blockers = plan_review(
-        repo, args.pr, findings, model_summary, args.event, args.commit)
+        repo, args.pr, findings, model_summary, args.event, args.commit, round_no)
     head, body = payload["commit_id"], payload["body"]
 
     for b in blockers:

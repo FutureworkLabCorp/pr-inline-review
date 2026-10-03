@@ -279,6 +279,48 @@ def test_check_head_refuses_moved_head():
     assert "다름" in P.check_head(meta, "cafebabe")
 
 
+def test_review_round_counts_markers_and_recorded_rounds():
+    assert R.review_round([]) == 1
+    assert R.review_round([{"sha": "a"}, {"sha": "b"}]) == 3   # pre-round markers
+    assert R.review_round([{"sha": "a", "round": 4}]) == 5     # a redone review
+
+
+def test_round_floor_rises():
+    assert R.round_floor(1) is None
+    assert R.round_floor(2) == "MEDIUM"
+    assert R.round_floor(3) == R.round_floor(7) == "HIGH"
+
+
+def test_round_policy_drops_repeats_and_low_new_findings():
+    old = {"path": "x.py", "category": "bug", "title": "raised before", "severity": "HIGH"}
+    low = {"path": "x.py", "category": "nit", "title": "new low", "severity": "LOW"}
+    fresh_low = {**low, "title": "low in new code", "introduced_by_increment": True}
+    med = {"path": "y.py", "category": "bug", "title": "new medium", "severity": "MEDIUM"}
+    kept, dropped = R.apply_round_policy([old, low, fresh_low, med], 2, {R.fingerprint(old)})
+    assert kept == [fresh_low, med]
+    assert [f["title"] for f, _ in dropped] == ["raised before", "new low"]
+    kept3, _ = R.apply_round_policy([med], 3, set())
+    assert kept3 == []                                          # round 3 floor is HIGH
+
+
+def test_round_one_keeps_everything_new():
+    low = {"path": "x.py", "category": "nit", "title": "t", "severity": "LOW"}
+    assert R.apply_round_policy([low], 1, set()) == ([low], [])
+
+
+def test_summary_body_records_round():
+    import review_post as P
+    body = P.summary_body([], "", head_sha="abc", round_no=2)
+    assert R.parse_state_marker(body)["round"] == 2
+    assert body.startswith("## Code Review — 2회차")
+
+
+def test_json_pages_reads_paginated_output():
+    import review_post as P
+    assert P._json_pages('[{"a": 1}]\n[{"a": 2}, {"a": 3}]') == [{"a": 1}, {"a": 2}, {"a": 3}]
+    assert P._json_pages("") == []
+
+
 # --------------------------------------------------------------------------- #
 # bare-python runner
 # --------------------------------------------------------------------------- #
