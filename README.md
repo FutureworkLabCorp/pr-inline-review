@@ -102,6 +102,15 @@ deterministically:
   and each finding's fingerprint (path + category + title), and every inline comment
   carries its fingerprint. The next round diffs only `sha..HEAD` and gives a verdict on
   each earlier finding instead of rediscovering it.
+- **Rounds go deeper but converge:** round 1 reviews the whole PR; round 2 adds a gap
+  sweep, callers two hops out and a narrow test run; round 3+ fans out per-angle
+  subagents. A deeper look always finds more nits, so the floor for a new finding rises
+  with the round (MEDIUM, then HIGH) and repeats of earlier findings are dropped, both
+  enforced by the posting script.
+- **Beyond correctness:** the sweep also lists deleted guards and tests (`REMOVED`),
+  duplicate changes (`DUP-*`) and docstrings that narrate the change or carry ticket
+  codes (`DOC-*`); the review asks why the change exists and weighs YAGNI against
+  optimization.
 - On batch failure, **fall back to per-comment posting** so one bad anchor can't
   sink the rest. `scripts/setup_check.py` verifies `gh`/auth/repo-access first, and
   `tests/` cover the deterministic core.
@@ -215,6 +224,13 @@ Python 유닛은 그대로 나온다.
 - **재리뷰 상태:** 리뷰 본문에 리뷰한 head와 finding fingerprint(path+category+title)를
   숨김 마커로 남기고, 인라인 코멘트마다 fingerprint를 붙인다. 다음 라운드는 `sha..HEAD`만
   보고 이전 지적마다 판정을 내린다 — 같은 걸 다시 찾지 않는다.
+- **회차가 오를수록 깊어지되 수렴한다:** 1회차는 PR 전체, 2회차는 gap sweep·호출부 2홉·좁은
+  테스트 실행을 더하고, 3회차부터는 각도별 서브에이전트를 쓴다. 깊이 볼수록 nit은 늘 더 나오므로
+  신규 지적 하한을 회차마다 올리고(MEDIUM, HIGH) 이전 회차 지적의 반복을 뺀다. 둘 다 게시
+  스크립트가 결정적으로 적용한다.
+- **정확성 밖도 본다:** 스윕이 지운 가드·테스트(`REMOVED`), 중복 수정(`DUP-*`), 고친 경위나
+  티켓 번호를 늘어놓는 docstring(`DOC-*`)을 열거하고, 리뷰는 변경이 왜 있는지와 YAGNI 대
+  최적화를 따진다.
 - 배치 실패 시 **개별 코멘트 폴백**으로 앵커 하나가 나머지를 죽이지 않게 한다.
   `scripts/setup_check.py`가 `gh`/인증/repo 접근을 선검사하고, `tests/`가 결정적 코어를 커버한다.
 

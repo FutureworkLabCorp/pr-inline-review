@@ -5,9 +5,12 @@ description: >
   로컬 소스 직접 분석·프로젝트 가이드 적용·기존 리뷰 반응 인식으로 클라우드 전용
   리뷰 에이전트보다 깊이 있는 리뷰를 제공한다. 내장 sink 스윕(scripts/sweep.py)이
   결함 범주를 전수 열거하고 diff가 건드린 모든 루틴(UNITS)을 읽기 바닥선으로 강제해
-  누락을 막는다. 리뷰 깊이 모드는 없고 항상 정밀 분석하며, 게시 직전 자가 검증
-  게이트로 false positive를 걸러낸다. dry-run 지원. 좌표·suggestion·게시는 전부
-  scripts/의 테스트된 헬퍼가 결정적으로 처리한다.
+  누락을 막는다. 정확성뿐 아니라 변경 의도, 중복 수정, YAGNI 대 최적화, 장황하거나
+  경위를 늘어놓는 docstring까지 본다. 1회차는 PR 전체를 넓게, 2회차부터는 범위를 좁히고
+  깊이를 올리며(gap sweep, 호출부 2홉, 좁은 테스트 실행, 3회차 각도별 서브에이전트),
+  회차마다 신규 지적 하한을 올려 리뷰가 수렴하게 한다. 게시 직전 검증 게이트로 false
+  positive를 걸러낸다. dry-run 지원. 좌표·suggestion·게시·회차 정책은 scripts/의 테스트된
+  헬퍼가 결정적으로 처리한다.
 ---
 
 # PR Inline Review Skill
@@ -27,8 +30,9 @@ description: >
 | 저장소 | `FutureworkLabCorp/linkBrain-server` | 없으면 git remote 자동 탐지 |
 | dry-run | `--dry-run`, `dry-run`, `콘솔`, `출력만`, `게시하지`, `테스트` | 게시 skip |
 | fresh | `--fresh`, `fresh`, `기존 무시`, `skip-existing` | Step 1(기존 리뷰 조회)·재리뷰 모드 skip, 전체를 처음부터 |
+| depth | `--depth 2`, `깊게`, `심화` | 회차와 무관하게 그 회차의 깊이로 리뷰 (`review_post.py --round N`도 같이 넘긴다) |
 
-- **리뷰 깊이를 고르는 모드는 없다.** 항상 로컬 소스 열람 + call-site 역추적 + 테스트 갭까지 정밀 분석한다. `--dry-run`·`--fresh`는 깊이가 아니라 게시/중복처리 스위치일 뿐이다.
+- **깊이는 회차가 정한다.** 1회차는 아래 절차 전부(로컬 소스 열람, call-site 역추적, 테스트 갭, 스윕)로 PR 전체를 본다. 2회차부터는 "회차별 깊이"의 심화 패스를 더한다. `--depth N`은 회차를 무시하고 그 깊이를 강제한다.
 - PR 번호가 없으면 → 로컬 리뷰, **무조건 dry-run**.
 - 이 스킬의 이전 리뷰가 PR에 있으면(Step 1에서 상태 마커 발견) **재리뷰 모드**로 자동 전환된다(Step 1-R). `--fresh`면 전환하지 않는다.
 
@@ -120,8 +124,29 @@ query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)
 1. **증분 diff:** `git fetch origin <PR_HEAD> -q && git diff <marker.sha> FETCH_HEAD`. `marker.sha`가 head의 조상이 아니면(force-push·rebase) 증분은 믿을 수 없다 — 전체 리뷰로 돌아가고 그 사실을 `_summary`에 적는다.
 2. **이전 finding마다 판정** (빠짐없이): `fixed`(코드로 확인, 고친 커밋 명시) / `open`(그대로) / `rebutted-accepted`(작성자 반박이 맞음) / `rebutted-rejected`(반박이 틀림, 근거 제시) / `outdated`(코드가 사라져 판정 불가). 작성자의 "Addressed in <sha>" 답글은 주장일 뿐이다 — 그 커밋의 코드를 읽고 판정한다.
 3. **스레드 답글:** `fixed`·`rebutted-*`는 해당 스레드에 한두 문장으로 답한다(`gh api repos/<REPO>/pulls/<PR>/comments/<첫 코멘트 databaseId>/replies -f body=...`). 같은 지적을 새 코멘트로 다시 달지 않는다.
-4. **새 finding은 증분 diff에서만** 찾는다(Step 3-A 스윕도 `--base <marker.sha>`). 2라운드부터는 증분이 새로 만든 문제가 아니면 MEDIUM 미만의 새 지적을 올리지 않는다 — 라운드마다 nit이 새로 생기면 리뷰가 수렴하지 않는다.
+4. **새 finding:** 기본 절차는 증분 diff에서만 돈다(Step 3-A 스윕도 `--base <marker.sha>`). 그 위에 아래 "회차별 깊이"의 심화 패스가 PR 전체를 본다. 증분이 새로 만든 문제는 finding에 `"introduced_by_increment": true`를 단다.
 5. `_summary`는 이전 finding 판정표로 시작한다(`| finding | 판정 | 근거 커밋 |`).
+
+---
+
+## 회차별 깊이
+
+회차 = 이 PR에 이미 있는 상태 마커 수 + 1. `review_post.py`가 리뷰 본문의 마커로 직접 계산하고, 새 마커에 `round`를 기록한다.
+
+| 회차 | 범위 | 더하는 것 | 신규 지적 하한 |
+|---|---|---|---|
+| 1 | PR 전체 | 기본 절차 (Step 3, 3-A의 REMOVED·DOC·DUP 포함) | 없음 |
+| 2 | 지난 지적 판정 + 증분 diff. 심화 패스만 PR 전체 | gap sweep, 호출부 2홉, 좁은 테스트 실행 | MEDIUM |
+| 3+ | 2와 같음 | 각도별 병렬 서브에이전트 + 후보당 검증 | HIGH |
+
+**왜 하한이 오르나.** 깊이 볼수록 사소한 지적은 늘 더 나온다. 하한이 그대로면 회차마다 nit이 새로 생겨 리뷰가 끝나지 않는다. 하한은 `review_post.py`가 결정적으로 적용한다: 하한 미만의 새 지적과 이전 회차가 이미 올린 지적(fingerprint 일치)은 게시하지 않고 콘솔에 사유를 출력한다. 예외는 `introduced_by_increment: true`인 지적뿐이다. 새로 들어온 코드는 처음 보는 코드라 어느 심각도든 올린다.
+
+**2회차 심화 패스** (1회차 구조로는 보이지 않는 결함만 겨냥한다):
+1. **gap sweep.** 맥락을 공유하지 않는 서브에이전트 하나(Agent 도구)에 PR diff, 이전 회차 finding 목록, 게시된 스레드 요약을 주고 "이 목록에 없는 결함만, MEDIUM 이상, 없으면 없다고" 찾게 한다. 지적 수를 채우라고 하지 않는다. 볼 곳을 알려 준다: 옮긴 코드에서 빠진 가드, 락·트랜잭션 범위 축소, setup/teardown 비대칭, 뒤집힌 설정 기본값, 바뀐 반환 형태를 모르는 호출부.
+2. **호출부 2홉.** `sweep.py ... --caller-depth 2`로 UNITS의 `callers2`를 받아, 반환 형태·예외·전제조건이 바뀐 함수만 호출부의 호출부까지 읽는다.
+3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 `uv run pytest <경로>`로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). `.env.pytest`나 DB가 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. `tests/evals/`는 돌리지 않는다(LLM·LangSmith 과금).
+
+**3회차 이상:** 각도마다 서브에이전트 하나, 한 메시지에서 병렬로: ① 줄 단위 + 바뀐 함수의 안 바뀐 줄, ② 삭제된 동작(REMOVED), ③ 파일 간 계약(호출부·스키마·직렬화), ④ 언어 함정(async, 기본 인자, 3.10 호환), ⑤ 구조와 altitude(근본 원인 대 땜질, 책임 위치). 각도끼리 서로의 후보를 지우지 않게 맥락을 나눈다. dedup 뒤 후보마다 6-1 독립 검증을 거친다. REFUTED는 코드로 반박을 구성할 수 있을 때만 쓴다. 비용이 크므로 8,000줄 이하 PR이면 `/code-review ultra`를 대안으로 사용자에게 알린다.
 
 ---
 
@@ -134,14 +159,14 @@ HEAD_SHA=$(gh api repos/<REPO>/pulls/<PR> --jq .head.sha)   # Step 7의 --commit
 
 `HEAD_SHA`는 이번 리뷰가 읽은 코드의 기준점이다. 리뷰 도중 작성자가 push하면 findings의 줄 번호가 다른 코드를 가리키게 되므로, 게시 스크립트가 이 값과 현재 head를 대조해 어긋나면 게시를 거부한다.
 
-`+` 줄에만 집중한다. `-` 줄은 리포트하지 않는다.
+`+` 줄에 집중한다. `-` 줄은 스윕의 `== REMOVED ==`로 판정한다: 지운 가드·검사·테스트가 새 코드 어디서 다시 보장되는지 묻고, 없으면 그 보장이 있어야 할 new-file 줄에 finding을 단다.
 > 좌표(line/side/position)는 절대 손으로 세지 않는다 — findings에는 **new-file 줄 번호만** 적고, 나머지는 `review_post.py`가 계산한다.
 
 ---
 
 ## Step 3. 소스 분석 (항상 정밀)
 
-**클라우드보다 유리한 두 번째 이유: diff 텍스트만 보지 않는다.** 리뷰 깊이 모드는 없다 — 매번 아래를 전부 수행한다.
+**클라우드보다 유리한 두 번째 이유: diff 텍스트만 보지 않는다.** 아래는 매 회차의 기본 절차다. 2회차부터는 "회차별 깊이"의 심화 패스가 더해진다.
 
 브랜치 전략 먼저 결정:
 ```bash
@@ -164,6 +189,21 @@ grep -rn "함수명\|클래스명" src/ --include="*.py" -l
 3-3. **기존 패턴 대조:** `grep -rn "pattern" src/` — 새 코드가 기존 패턴을 따르나, 불일치 추상화를 들여오나.
 3-4. **테스트 갭:** 새 `+` 코드 경로(분기·루프·early return)를 열거하고 테스트 존재 여부 매핑. 미커버는 LOW/MEDIUM.
 3-5. **외부 스토리지 값의 단위·타입을 주장하는 이슈**라면, 그 write 경로를 grep으로 확인한 뒤 리포트 (단위 오해 false-positive 방지).
+
+정확성 밖의 네 관점. 코드가 맞아도 이 변경이 있어야 하는지, 이 모양이어야 하는지를 본다.
+
+3-6. **변경 의도.** PR 본문·커밋 메시지·티켓이 말하는 목적과 diff가 하는 일이 맞는가. 설명 없는 변경(목적과 무관한 파일, 끼어든 리팩토링)은 "왜 이 PR에 있나"를 묻는 finding이다(AGENTS.md "One Issue Per PR"). 목적 대비 변경이 과하면 더 작은 대안을 한 줄로 제시한다. 의도를 지어내지 않는다 — 설명이 없으면 없다고 쓴다.
+
+3-7. **중복 수정.** 스윕의 `DUP-*` HIT를 판정하고, 같은 파일을 건드리는 열린 PR을 확인한다:
+```bash
+gh pr list --repo <REPO> --state open --json number,title,files \
+  --jq '.[] | select(.number != <PR>) | "\(.number) \(.title): \([.files[].path] | join(" "))"'
+```
+변경 파일이 겹치는 PR은 본문을 읽어, 같은 문제를 이미 고치고 있으면 finding(MEDIUM, 두 PR 번호와 겹치는 지점)이다. 겹치기만 하면 충돌 가능성을 `_summary`에 한 줄로 남긴다.
+
+3-8. **YAGNI 대 최적화.** 변경이 일반화(값이 하나뿐인 설정, 구현이 하나뿐인 추상화, 아무도 넘기지 않는 인자, 쓰이지 않는 확장 지점)나 최적화(캐시, 배치, 동시성, 사전 계산)를 들여오면 둘을 비교하는 finding을 쓴다. explanation은 세 가지를 담는다: 지금 치르는 비용(복잡도·읽는 사람의 부담·새 실패 경로), 얻는다는 이득과 그 근거(측정, 호출 빈도, 요구사항), 그리고 권고. 근거 없는 일반화는 YAGNI가 이긴다(AGENTS.md "Prefer minimal, focused changes"). 측정 없는 최적화는 막지 말고 수치를 요청한다. 반대로 단순한 쪽이 분명한 병목(루프 안 쿼리, 반복 I/O)을 만들면 최적화를 권한다. category는 `design`, 보통 MEDIUM/LOW.
+
+3-9. **docstring·주석.** 스윕의 `DOC-*` HIT를 `reference/sweep-categories.md`대로 판정한다. 기준은 linkBrain-server `.docs/Code-Conventions.md` "Docstrings and comments"다: 코드가 말하지 못하는 것(왜 이 방식인지, 확인한 제약, 의존하는 외부 동작)만 남기고, 고친 경위·이전 동작·티켓 번호·시그니처 반복은 지운다. 길이 자체는 지적하지 않는다 — 지울 문장을 인용한다. 줄인 판본이 6줄 이하면 suggestion으로 단다. 이 변경이 쓰지 않은 기존 docstring은 대상이 아니다.
 
 ---
 
@@ -197,7 +237,8 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 출력 네 섹션을 이렇게 소비한다:
 - **`== HITS ==` / `== MANUAL ==`** — Step 4 이슈 후보의 출발점(각 행은 후보일 뿐, 반드시 Step 6에서 검증). 카테고리별 전수라 "빠뜨림"을 막는다. **행마다 무엇을 물을지는 `$SKILL_DIR/reference/sweep-categories.md`** 의 해당 카테고리 행을 본다(나온 카테고리만). HIT는 첫 행만이 아니라 전부 판정한다.
 - **`== SWEPT-NONE ==`** — 스캔했고 후보가 없던 카테고리. 할 일 없음, 커버리지 기록에만 옮긴다.
-- **`== UNITS ==`** — diff가 건드린 **모든 루틴**(Python=`ast`, TS/TSX=tree-sitter). 이게 "무엇을 읽을지"의 **바닥선**이다: 패턴이 침묵한 의도(intent) 버그에 닿는 통로. 각 UNIT을 `Read(file, offset, limit)`로 읽고 Step 4에서 finding 또는 "read, clean"으로 처리한다. `func`=함수 통째(데코 포함), `block`=거대 함수의 hunk 블록만(+`oversized-fn` 플래그=자체 finding 후보), `module`=모듈 레벨. `callees`/`callers`는 HIT/타입경계가 필요를 만들 때만 한 홉 확장.
+- **`== UNITS ==`** — diff가 건드린 **모든 루틴**(Python=`ast`, TS/TSX=tree-sitter). 이게 "무엇을 읽을지"의 **바닥선**이다: 패턴이 침묵한 의도(intent) 버그에 닿는 통로. 각 UNIT을 `Read(file, offset, limit)`로 읽고 Step 4에서 finding 또는 "read, clean"으로 처리한다. `func`=함수 통째(데코 포함), `block`=거대 함수의 hunk 블록만(+`oversized-fn` 플래그=자체 finding 후보), `module`=모듈 레벨. `callees`/`callers`는 HIT/타입경계가 필요를 만들 때만 한 홉 확장. 2회차의 `--caller-depth 2`면 `callers2=파일(via 호출자)`가 붙는다.
+- **`== REMOVED ==`** — 지운 줄 중 무언가를 지키던 것(raise, 가드, 권한·락·검증 호출, 테스트). 옮긴 코드와 이름이 돌아온 정의(고쳐 쓴 테스트)는 스크립트가 뺐다. 행마다 그 줄이 지키던 불변식을 한 문장으로 말하고, 새 코드 어디서 다시 보장되는지 `file:line`으로 찾는다. 못 찾으면 finding이다. 지운 테스트는 그 동작을 다른 테스트가 덮는지 확인한다.
 
 **커버리지 기록.** 스윕이 낸 모든 카테고리와 모든 UNIT에 판정을 남긴다 — finding / "swept, none" / "read, clean" / "판정 보류(이유)". 이 기록은 `_summary` 끝에 접힌 블록(`<details><summary>스윕 커버리지</summary> … </details>`)으로 넣는다. 리뷰어가 "이 범주는 봤는가"를 PR에서 확인할 수 있고, 이름이 빠진 카테고리는 스윕을 건너뛴 것으로 간주된다. 판정을 보류한 동작(범위 밖이라 판단을 미룬 것)도 이유와 함께 적는다 — 조용히 빠지는 항목이 없게 한다.
 
@@ -260,6 +301,7 @@ MB=$(git merge-base origin/develop FETCH_HEAD)
 
 **규칙 (엄수):**
 - `line` = **new-file 줄 번호** (diff의 `+`/컨텍스트 줄). position 계산 금지.
+- 2회차 이상에서 증분이 새로 만든 문제면 `"introduced_by_increment": true`. 회차 하한을 면제받는 유일한 방법이므로, 지난 리뷰 이후 커밋이 들여온 코드일 때만 단다.
 - 여러 줄 교체는 `start_line`(같은 hunk 내, `line`보다 작거나 같음)만 추가. side는 기본 RIGHT.
 - `suggestion`은 **교체 후 남길 줄들의 배열**. ` ```suggestion ` 펜스를 직접 쓰지 않는다 — 스크립트가 감싼다.
 - **범위는 통째로 교체된다.** GitHub Apply는 `start_line`~`line` **전 줄을 삭제하고 suggestion 전체를 삽입**한다. 범위 안에서 유지할 줄도 suggestion에 반드시 포함한다 — 부분 교체에서 줄을 빠뜨리면 Apply가 그 줄을 지운다(스크립트가 범위보다 짧은 suggestion을 경고). 줄 삽입으로 suggestion 줄 수 > 범위 줄 수가 되는 건 정상.
@@ -329,7 +371,8 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --fin
 - event 기본 결정: **CRITICAL/HIGH 있으면 REQUEST_CHANGES / MEDIUM·LOW만 COMMENT / 없으면 APPROVE**. 이것도 판단이므로 `--event REQUEST_CHANGES|COMMENT`로 오버라이드 가능(APPROVE는 게시 자체가 불가 — self-approve 방지).
 - **자기 PR이면** REQUEST_CHANGES를 COMMENT로 바꾼다. GitHub이 자기 PR의 REQUEST_CHANGES를 422로 거부하기 때문이다(예전에는 이 때문에 배치가 실패해 코멘트가 낱개로 흩어졌다). 머지 차단 의도는 `_summary` 첫 줄에 적는다.
 - 인라인으로 달지 못한(skip된) finding은 리뷰 본문 "인라인에 달지 못한 지적" 소절에 내용째 싣는다 — 집계표 숫자로만 남지 않는다.
-- 리뷰 본문 끝에 상태 마커(리뷰한 head SHA + finding fingerprint 목록)를, 인라인 코멘트마다 fingerprint 마커를 숨겨 붙인다. 다음 라운드의 Step 1-R이 이것을 읽는다.
+- 리뷰 본문 끝에 상태 마커(리뷰한 head SHA + finding fingerprint 목록 + 회차)를, 인라인 코멘트마다 fingerprint 마커를 숨겨 붙인다. 다음 라운드의 Step 1-R이 이것을 읽는다.
+- **회차 정책:** PR의 기존 리뷰에서 마커를 읽어 회차를 정하고, 이전 회차가 올린 지적과 회차 하한(2회차 MEDIUM, 3회차+ HIGH) 미만의 새 지적을 뺀다(`introduced_by_increment` 예외). 뺀 항목은 사유와 함께 콘솔에 출력된다. `--round N`으로 회차를 강제하고, `--fresh`는 이전 회차를 무시한다.
 - **line 기반 단일 배치**로 `/pulls/{pr}/reviews`에 1회 게시 (position 안 씀).
 - 배치 실패 시 **개별 코멘트 폴백** — 앵커 하나가 깨져도 나머지는 살린다.
 - 앵커 가능한 코멘트가 하나도 없어도 **요약 리뷰만 게시**해 verdict를 보존한다 — findings가 전부 skip된 경우든, 지적 없이 `_summary`만 남기는 경우든. 막히는 건 APPROVE 하나뿐이고(자기 PR 자동승인 불가), findings가 없으면 그게 기본 event라 요약만 올리려면 `--event COMMENT`를 명시해야 한다. dry-run도 같은 판정을 출력하므로, 게시될지 여부를 미리 볼 수 있다.
@@ -354,10 +397,11 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --fin
 ```
 setup_check → 가이드 로드(base 판본) → (기존 리뷰·스레드 읽기 → 마커 있으면 재리뷰 1-R)
    → diff 수집 + HEAD_SHA 고정
-   → sweep.py(HITS/MANUAL 후보 + UNITS 읽기 바닥선) → 소스 정밀 분석 → findings 초안
+   → sweep.py(HITS/MANUAL 후보 + REMOVED + UNITS 읽기 바닥선) → 소스 정밀 분석
+     + 의도·중복·YAGNI 대 최적화·docstring → (2회차+) 심화 패스 → findings 초안
    → ★검증 게이트: 자기검증 + HIGH 이상은 독립 검증 서브에이전트★
    → 확인됨=findings.json / 미확인·기존 결함·커버리지=_summary
-   → review_post.py --commit $HEAD_SHA --dry-run 로 검증 → 이상 없으면 게시
+   → review_post.py --commit $HEAD_SHA --dry-run 로 검증(회차·하한·반복 제거 확인) → 이상 없으면 게시
    → (different-branch) worktree 유지, 삭제 여부는 사용자에게 확인
 ```
 
