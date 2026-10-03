@@ -24,6 +24,9 @@ not a finding: most are benign, and each one gets a verdict.
 | `DOC-RESTATE` | An `Args:`/`Returns:` block. Does each entry add something the annotation does not (units, an invariant, who owns the value, what `None` means)? Entries that only repeat names and types go. LOW. |
 | `DOC-STEPS` | A numbered step comment signals a function that wants splitting; a banner signals a module that does. Flag new ones only; ones already in the file stay. LOW. |
 | `DOC-LONG` | Length alone is never the finding. Read it sentence by sentence: is each one information the code cannot give (a probed constraint, an observed external behaviour, why this way and not the obvious one)? Retelling, restating the code, or the change's history is the finding — quote the sentences to cut. A comment grown into a document belongs in `.docs/` or the wiki, with one sentence and a pointer left behind. |
+| `DUP-IN-DIFF` | The same block added twice in this PR. Should it be one helper? A finding when the copies must change together (a fix to one would be missed in the other); not one when they only look alike and will diverge. MEDIUM when the block holds logic, LOW for setup. |
+| `DUP-NAME` | A new module-level definition shares its name with one in another file. Is it a reimplementation of the existing one (then reuse it, or say why not), or an unrelated thing with a clashing name (then rename one)? Read both before judging. |
+| `DUP-EXISTING` | An added line and the next one already sit together elsewhere in the tree. Copied code? Then the question is the same as DUP-IN-DIFF, against code that already exists. A stopped-early warning means the rest of the diff was not looked up. |
 | `SH-OUTBOUND` | Is the URL/host attacker-influenced? Is the response piped into a shell? |
 | `SH-INJECTION` | Does `eval` / `bash -c` interpolate any external input? |
 | `SH-UNSAFE-RM` | Can the variable be empty/unset (→ deletes the parent dir) or contain spaces/`..`? Is `set -u` in effect? |

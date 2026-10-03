@@ -116,6 +116,19 @@ class DocsConfig:
     long_comment_block: int = 6
 
 
+@dataclass
+class DupConfig:
+    """Duplicate-change detection sizes (patterns.toml [global] dup_*)."""
+    window: int = 4
+    min_line: int = 40
+    max_greps: int = 40
+    # Tests repeat their setup on purpose and reuse helper names across files.
+    skip_paths: re.Pattern[str] | None = None
+
+
+DUP = DupConfig()
+DUP_CATEGORIES = ("DUP-IN-DIFF", "DUP-NAME", "DUP-EXISTING")
+
 # Set by load_config(); the special scanners share one signature and read it here.
 DOCS = DocsConfig()
 COMMENT_RE: dict[str, re.Pattern[str]] = {}
@@ -140,7 +153,7 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         callers_max=int(g.get("unit_callers_max", 5)),
         max_blocks=int(g.get("unit_max_blocks", 3)),
     )
-    global DOCS
+    global DOCS, DUP
 
     def _re(key: str) -> re.Pattern[str] | None:
         return re.compile(g[key]) if key in g else None
@@ -153,6 +166,12 @@ def load_config() -> tuple[list[Lang], list[str], UnitConfig, JediConfig]:
         long_docstring=int(g.get("doc_long_docstring", 8)),
         long_private_docstring=int(g.get("doc_long_private_docstring", 3)),
         long_comment_block=int(g.get("doc_long_comment_block", 6)),
+    )
+    DUP = DupConfig(
+        window=int(g.get("dup_window", 4)),
+        min_line=int(g.get("dup_min_line", 40)),
+        max_greps=int(g.get("dup_max_greps", 40)),
+        skip_paths=_re("dup_skip_paths"),
     )
     jedi_cfg = JediConfig(
         enabled=bool(g.get("jedi_enabled", True)),
@@ -1137,7 +1156,138 @@ def scanned_categories(
                 add(v)
         if lang.dead_code:
             add("DEAD-CODE")
+            for c in DUP_CATEGORIES:
+                add(c)
     return seen
+
+
+# --- Duplicate changes --------------------------------------------------------
+#
+# A change that repeats itself, or repeats code the repository already has, is a
+# review question the line scanners cannot ask: each copy looks fine on its own.
+
+_TRIVIAL = re.compile(r"^\s*([)}\]]+[,;]?|else:|try:|finally:|pass|return|break|continue|\*/|/\*\*|#.*|//.*)?\s*$")
+_NOT_LOGIC = re.compile(r"^\s*(import\b|from\s+\S+\s+import\b|@|#|//|\*|(async\s+)?def\b|class\b|export\s+(async\s+)?(function|const|class)\b)")
+
+
+def _dup_skipped(path: str) -> bool:
+    return bool(DUP.skip_paths and DUP.skip_paths.search(path))
+
+
+def _added_lines(ranges: dict[str, list[tuple[int, int]]], files: list[str]) -> dict[str, dict[int, str]]:
+    out: dict[str, dict[int, str]] = {}
+    for f in files:
+        if _dup_skipped(f):
+            continue
+        try:
+            lines = Path(f).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        out[f] = {n: lines[n - 1] for a, b in ranges[f] for n in range(a, min(b, len(lines)) + 1)}
+    return out
+
+
+def _dup_in_diff(hits: Hits, added: dict[str, dict[int, str]]) -> None:
+    w = DUP.window
+    seen: dict[tuple[str, ...], tuple[str, int]] = {}
+    found: dict[str, set[int]] = {}
+    for f, lines in added.items():
+        for n in sorted(lines):
+            window = [lines.get(n + k) for k in range(w)]
+            if any(t is None for t in window):
+                continue
+            key = tuple(_norm(t) for t in window)  # type: ignore[arg-type]
+            if sum(1 for t in key if len(t) >= 20 and not _TRIVIAL.match(t)) < 2:
+                continue
+            if key in seen:
+                pf, pn = seen[key]
+                if pf != f or abs(pn - n) >= w:
+                    if (n - 1) not in found.get(f, set()):
+                        hits.add("DUP-IN-DIFF", f, n, f"{w}+ lines also added at {pf}:{pn}")
+                    found.setdefault(f, set()).add(n)
+            else:
+                seen[key] = (f, n)
+
+
+def _def_line(path: str, name: str) -> int:
+    pat = re.compile(rf"^(export\s+)?(async\s+)?(def|class|function|const)\s+{re.escape(name)}\b")
+    try:
+        for n, line in enumerate(Path(path).read_text(errors="replace").splitlines(), start=1):
+            if pat.match(line):
+                return n
+    except OSError:
+        pass
+    return 0
+
+
+def _dup_name(hits: Hits, diff_text: str, langs: list[Lang]) -> None:
+    for lang in langs:
+        dc = lang.dead_code
+        if dc is None:
+            continue
+        current: str | None = None
+        for line in diff_text.splitlines():
+            if line.startswith("+++ b/"):
+                current = line[6:]
+                continue
+            if not (current and Path(current).suffix in lang.extensions) or _dup_skipped(current):
+                continue
+            m = dc.def_re.match(line)
+            # Module level only: two methods may share a name on purpose.
+            if not m or line[1:2].isspace():
+                continue
+            name = m.group(1)
+            if (dc.skip and dc.skip.match(name)) or name.startswith("test"):
+                continue
+            out = run(["git", "grep", "-n", "-I", "-E", rf"^(export\s+)?(async\s+)?(def|class|function|const)\s+{name}\b", "--", dc.grep_glob])
+            others = [ln for ln in out.stdout.splitlines()
+                      if not ln.startswith(f"{current}:") and not _dup_skipped(ln.split(":", 1)[0])]
+            if others:
+                where = ", ".join(":".join(o.split(":", 2)[:2]) for o in others[:3])
+                hits.add("DUP-NAME", current, _def_line(current, name), f"`{name}` is already defined at {where}")
+
+
+def _dup_existing(hits: Hits, added: dict[str, dict[int, str]]) -> str | None:
+    greps = 0
+    for f, lines in added.items():
+        glob = f"*{Path(f).suffix}" if Path(f).suffix else None
+        if glob is None:
+            continue
+        skip_until = 0
+        for n in sorted(lines):
+            text, nxt = lines[n].strip(), lines.get(n + 1)
+            if n <= skip_until or nxt is None or len(_norm(text)) < DUP.min_line or _NOT_LOGIC.match(text):
+                continue
+            if len(_norm(nxt)) < 20:
+                continue
+            if greps >= DUP.max_greps:
+                return f"DUP-EXISTING stopped after {DUP.max_greps} lookups — read the rest of the diff for copied code"
+            greps += 1
+            out = run(["git", "grep", "-n", "-I", "-F", "-e", text, "--", glob])
+            for hit in out.stdout.splitlines():
+                path, ln, _ = hit.split(":", 2)
+                ln_no = int(ln)
+                if _dup_skipped(path) or (path in added and ln_no in added[path]):
+                    continue  # the hit is this change's own added code
+                try:
+                    other = Path(path).read_text(errors="replace").splitlines()
+                except OSError:
+                    continue
+                if ln_no < len(other) and _norm(other[ln_no]) == _norm(nxt):
+                    hits.add("DUP-EXISTING", f, n, f"also at {path}:{ln_no} (2+ consecutive lines)")
+                    skip_until = n + DUP.window
+                    break
+    return None
+
+
+def scan_duplicates(hits: Hits, diff_text: str, ranges: dict[str, list[tuple[int, int]]],
+                    files: list[str], langs: list[Lang]) -> list[str]:
+    """DUP-IN-DIFF, DUP-NAME and DUP-EXISTING; returns warnings."""
+    added = _added_lines(ranges, files)
+    _dup_in_diff(hits, added)
+    _dup_name(hits, diff_text, langs)
+    warn = _dup_existing(hits, added)
+    return [warn] if warn else []
 
 
 # --- Main --------------------------------------------------------------------
@@ -1207,6 +1357,8 @@ def main() -> int:
                     ran_linters.add(name)
 
     scan_dead_code(hits, diff_text, langs, jr)
+    code_files = [f for fs in by_lang.values() for f in fs]
+    linter_warnings.extend(scan_duplicates(hits, diff_text, ranges, code_files, langs))
 
     # --- Report ---
     counts = ", ".join(f"{len(fs)} {n}" for n, fs in by_lang.items())

@@ -30,6 +30,14 @@ doc_restate_regex = '^\s*(Args|Arguments|Parameters|Returns|Yields|Raises):\s*$'
 doc_long_docstring = 8
 doc_long_private_docstring = 3
 doc_long_comment_block = 6
+# Duplicate changes (DUP-*). DUP-IN-DIFF: the same `dup_window` normalized lines added
+# twice. DUP-EXISTING: an added line of `dup_min_line`+ chars and the one after it found
+# together elsewhere in the tree, at most `dup_max_greps` lookups. DUP-NAME: an added
+# module-level definition whose name is already defined in another file.
+dup_window = 4
+dup_min_line = 40
+dup_max_greps = 40
+dup_skip_paths = '(^|/)tests?/|(^|/)test_[^/]*$|_test\.py$|\.(test|spec)\.tsx?$'
 # Review-unit sizing (Python == UNITS ==). A changed function <= size_threshold is read
 # whole; a larger one touched only sparsely is read as the hunk's enclosing block, unless
 # the diff covers >= coverage_promote of it (then promoted back to a whole read).

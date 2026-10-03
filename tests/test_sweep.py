@@ -137,6 +137,42 @@ def test_ts_comment_narration():
 
 
 # --------------------------------------------------------------------------- #
+# DUP-*
+# --------------------------------------------------------------------------- #
+
+BLOCK = [
+    "    response = client.post(url, json=payload, timeout=30)",
+    "    response.raise_for_status()",
+    "    data = response.json()['items']",
+    "    return [normalize(item) for item in data]",
+]
+
+
+def _dup(added):
+    hits = S.Hits()
+    S._dup_in_diff(hits, added)
+    return [r.split("\t", 1)[1] for r in hits.by_cat.get("DUP-IN-DIFF", [])]
+
+
+def test_block_added_twice_is_one_row_per_copy():
+    a = {n: t for n, t in enumerate(BLOCK, start=10)}
+    b = {n: t for n, t in enumerate(BLOCK, start=50)}
+    got = _dup({"src/app/a.py": a, "src/app/b.py": b})
+    assert got == ["src/app/b.py:50\t4+ lines also added at src/app/a.py:10"], got
+
+
+def test_trivial_repeats_are_not_duplicates():
+    trivial = {n: t for n, t in enumerate(["    pass", "    return", "    )", "    else:"], start=1)}
+    assert _dup({"src/app/a.py": trivial, "src/app/b.py": dict(trivial)}) == []
+
+
+def test_test_paths_are_skipped():
+    assert S._dup_skipped("tests/unit_tests/x/test_a.py")
+    assert S._dup_skipped("web/src/a.test.tsx")
+    assert not S._dup_skipped("src/app/rag/ingest.py")
+
+
+# --------------------------------------------------------------------------- #
 # bare-python runner
 # --------------------------------------------------------------------------- #
 
