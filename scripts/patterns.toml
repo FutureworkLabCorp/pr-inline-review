@@ -115,9 +115,17 @@ regex = '^\s*(from|import)\s+src\.app\b'
 paths = '^src/'
 
 [[py.patterns]]
-category = "CYPHER-COMPAT"
-# A graph query has to read the same on Neo4j and ArcadeDB, which silently differ.
-regex = '\b(OPTIONAL\s+MATCH|MATCH|MERGE|UNWIND|DETACH\s+DELETE|CALL\s*\{)\s*[\(\{$a-z]'
+category = "CYPHER-ARCADEDB"
+# Cypher shapes that ArcadeDB (the on-prem graph) reads differently from Neo4j, mostly with no
+# error. Judge each hit against .docs/Compatible-ArcadeDB.md in the repository under review; the
+# IDs there are the alternatives here, in order: T1/T8 aliased dot read, T1 collect(dot), T2
+# `IN $`, T2 compare with $, T3 `{key: $param}`, T4 toLower/toUpper and the string functions,
+# T5 ORDER BY dot, C1 REMOVE, C2/C3 full-text and vector index, C4/C5 apoc subgraphAll,
+# C6 CALL db.*, C8 CREATE DATABASE, S1 driver.session() without database=. Properties named
+# uuid/*_uuid, id and *count are left out: their values can never be time-shaped. Cypher
+# keywords are upper case, so Python (`import x as y`, `str.split`) does not trip it.
+regex = '\b[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*\s+AS\s+\w|\bcollect\(\s*(?:DISTINCT\s+)?[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*\s*\)|\b[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*\s+IN\s+\$|\bWHERE\s+[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*\s*(?:=|<>|STARTS WITH|ENDS WITH|CONTAINS)\s*\$|\{\s*(?!\w*uuid\b|id\b)[a-z_]\w*\s*:\s*\$|\b(?:toLower|toUpper)\(\s*[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*|(?<![.\w])(?:trim|ltrim|rtrim|substring|replace|split)\(\s*[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*|\bORDER BY\s+[a-z_]\w*\.(?!\w*uuid\b|id\b|\w*count\b)[a-z_]\w*|\bREMOVE\s+[a-z_]\w*\.[`\w]|\bdb\.index\.(?:fulltext|vector)\.|\bCREATE\s+(?:FULLTEXT|VECTOR)\s+INDEX|\bapoc\.path\.subgraphAll\b|\bCALL\s+db\.(?:labels|relationshipTypes|propertyKeys)\(|\bCREATE\s+DATABASE\b|\bdriver\.session\((?![^)]*database)'
+exclude = '^\s*#'
 
 [py.linter]
 command = ["ruff", "check", "--select", "ASYNC,S", "--output-format", "concise", "--no-fix"]
