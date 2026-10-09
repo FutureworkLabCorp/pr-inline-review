@@ -285,10 +285,9 @@ def test_review_round_counts_markers_and_recorded_rounds():
     assert R.review_round([{"sha": "a", "round": 4}]) == 5     # a redone review
 
 
-def test_round_floor_rises():
+def test_round_floor_rises_to_medium_and_stops():
     assert R.round_floor(1) is None
-    assert R.round_floor(2) == "MEDIUM"
-    assert R.round_floor(3) == R.round_floor(7) == "HIGH"
+    assert R.round_floor(2) == R.round_floor(3) == R.round_floor(7) == "MEDIUM"
 
 
 def test_round_policy_drops_repeats_and_low_new_findings():
@@ -299,8 +298,9 @@ def test_round_policy_drops_repeats_and_low_new_findings():
     kept, dropped = R.apply_round_policy([old, low, fresh_low, med], 2, {R.fingerprint(old)})
     assert kept == [fresh_low, med]
     assert [f["title"] for f, _ in dropped] == ["raised before", "new low"]
-    kept3, _ = R.apply_round_policy([med], 3, set())
-    assert kept3 == []                                          # round 3 floor is HIGH
+    kept3, dropped3 = R.apply_round_policy([med, low], 3, set())
+    assert kept3 == [med]                                       # round 3 floor is still MEDIUM
+    assert [f["title"] for f, _ in dropped3] == ["new low"]
 
 
 def test_round_one_keeps_everything_new():

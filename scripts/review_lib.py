@@ -17,8 +17,8 @@ Responsibilities (all pure functions, no network, no file I/O):
   7. event_for_author()      GitHub rejects REQUEST_CHANGES on your own PR
   8. review_round() / apply_round_policy()
                              which round this review is, and which findings it may
-                             still post: no repeats, and a severity floor that rises
-                             with the round so a deeper review still converges
+                             still post: no repeats, and a MEDIUM severity floor
+                             from round 2 on so a deeper review still converges
 
 The GitHub "Create a review" API accepts line-based coordinates
 (path, line, side, start_line, start_side) inside comments[], so a single
@@ -495,11 +495,13 @@ def round_floor(round_no: int) -> Optional[str]:
     """The lowest severity a NEW finding may have in this round.
 
     Round 1 has none. Later rounds look deeper, and a deeper look always finds
-    more nits; without a rising floor the review never converges.
+    more nits; without a floor the review never converges. The floor stops at
+    MEDIUM: a design or resource problem found in round 3 is no less worth a
+    thread than one found in round 2, and the nits are already cut at LOW.
     """
     if round_no <= 1:
         return None
-    return "MEDIUM" if round_no == 2 else "HIGH"
+    return "MEDIUM"
 
 
 def apply_round_policy(findings: list, round_no: int, prior_fps: set) -> tuple:
