@@ -35,9 +35,9 @@ def test_deleted_guard_is_listed():
     assert rows == ["src/app/x.py:10\tif user is None:", "src/app/x.py:11\traise PermissionError()"], rows
 
 
-def test_moved_guard_is_not_listed():
+def test_same_text_added_elsewhere_does_not_hide_deleted_guard():
     d = _diff("src/app/x.py", ["@@ -10 +10,0 @@", "-    raise PermissionError()", "@@ -30,0 +29 @@", "+        raise PermissionError()"])
-    assert S.scan_removed(d, LANGS) == []
+    assert S.scan_removed(d, LANGS) == ["src/app/x.py:10\traise PermissionError()"]
 
 
 def test_plain_deleted_line_is_not_listed():
@@ -45,7 +45,7 @@ def test_plain_deleted_line_is_not_listed():
     assert S.scan_removed(d, LANGS) == []
 
 
-def test_rewritten_test_is_not_listed_but_a_deleted_one_absorbs_its_checks():
+def test_rewritten_test_keeps_deleted_checks_visible():
     d = _diff("tests/test_x.py", [
         "@@ -5,3 +5,0 @@",
         "-def test_kept(tmp_path):",
@@ -60,7 +60,7 @@ def test_rewritten_test_is_not_listed_but_a_deleted_one_absorbs_its_checks():
     ])
     rows = S.scan_removed(d, LANGS)
     assert rows[-1] == "tests/test_x.py:20\tdef test_gone():  (+2 checks deleted with it)", rows
-    assert not any("test_kept" in r for r in rows)
+    assert any("test_kept" in r for r in rows)
 
 
 def test_repeated_line_is_one_row():
