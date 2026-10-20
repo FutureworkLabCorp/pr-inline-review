@@ -203,8 +203,8 @@ def test_payload_skips_finding_for_file_not_in_diff():
     assert "not in diff" in skipped[0]["_reason"]
 
 
-def test_event_approve_when_no_findings():
-    assert R.decide_event([]) == "APPROVE"
+def test_event_comment_when_no_findings():
+    assert R.decide_event([]) == "COMMENT"
     assert R.decide_event([{"severity": "LOW"}]) == "COMMENT"
 
 
@@ -285,22 +285,21 @@ def test_review_round_counts_markers_and_recorded_rounds():
     assert R.review_round([{"sha": "a", "round": 4}]) == 5     # a redone review
 
 
-def test_round_floor_rises():
-    assert R.round_floor(1) is None
-    assert R.round_floor(2) == "MEDIUM"
-    assert R.round_floor(3) == R.round_floor(7) == "HIGH"
+def test_security_findings_survive_later_rounds():
+    finding = {"path": "x.py", "category": "security", "title": "exposure", "severity": "LOW"}
+    assert R.apply_round_policy([finding], 7, set()) == ([finding], [])
 
 
-def test_round_policy_drops_repeats_and_low_new_findings():
+def test_round_policy_drops_only_repeated_findings():
     old = {"path": "x.py", "category": "bug", "title": "raised before", "severity": "HIGH"}
     low = {"path": "x.py", "category": "nit", "title": "new low", "severity": "LOW"}
     fresh_low = {**low, "title": "low in new code", "introduced_by_increment": True}
     med = {"path": "y.py", "category": "bug", "title": "new medium", "severity": "MEDIUM"}
     kept, dropped = R.apply_round_policy([old, low, fresh_low, med], 2, {R.fingerprint(old)})
-    assert kept == [fresh_low, med]
-    assert [f["title"] for f, _ in dropped] == ["raised before", "new low"]
+    assert kept == [low, fresh_low, med]
+    assert [f["title"] for f, _ in dropped] == ["raised before"]
     kept3, _ = R.apply_round_policy([med], 3, set())
-    assert kept3 == []                                          # round 3 floor is HIGH
+    assert kept3 == [med]
 
 
 def test_round_one_keeps_everything_new():
@@ -322,6 +321,124 @@ def test_json_pages_reads_paginated_output():
 
 
 # --------------------------------------------------------------------------- #
+def test_changed_anchor_does_not_keep_applyable_suggestion():
+    dm = R.parse_diff(DIFF)
+    for location in ({"start_line": 5, "line": 196}, {"line": 202}):
+        f = {"path": "src/app/core/worker.py", "title": "fix", "suggestion": ["replacement()"], **location}
+        payload, skipped, warnings = R.build_review_payload([f], dm, "")
+        assert not skipped
+        assert "```suggestion" not in payload["comments"][0]["body"]
+        assert warnings
+
+
+def test_prior_high_survives_deduplication_in_verdict():
+    import review_post as P
+    old = {"path": "x.py", "title": "broken", "severity": "HIGH"}
+    fp = R.fingerprint(old)
+    markers = [{"sha": "old", "issues": [{**old, "fingerprint": fp}]}]
+    outstanding = P.review_prior_state(markers, [{"fingerprint": fp, "status": "open"}])
+    kept, _ = R.apply_round_policy([old], 2, {fp})
+    assert kept == []
+    assert R.decide_event(kept + outstanding) == "REQUEST_CHANGES"
+
+
+def test_prior_findings_require_explicit_dispositions():
+    import review_post as P
+    markers = [{"sha": "old", "findings": ["abc"]}]
+    try:
+        P.review_prior_state(markers, [])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Missing dispositions must not imply that old findings were fixed")
+    assert P.review_prior_state(markers, [{"fingerprint": "abc", "status": "fixed", "evidence": "abc123: permission guard restored"}]) == []
+
+
+def test_prior_findings_cannot_close_without_evidence():
+    import review_post as P
+    markers = [{"sha": "old", "findings": ["abc"]}]
+    for status in ("fixed", "rebutted-accepted", "withdrawn"):
+        try:
+            P.review_prior_state(markers, [{"fingerprint": "abc", "status": status}])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Closing a prior issue requires evidence")
+    for status in ("outdated", "unverified", "rebutted-rejected"):
+        unresolved = P.review_prior_state(markers, [{"fingerprint": "abc", "status": status}])
+        assert R.decide_event(unresolved) == "REQUEST_CHANGES"
+
+
+def test_prior_finding_can_be_withdrawn_without_a_code_change():
+    import review_post as P
+    issue = {"fingerprint": "abc", "severity": "HIGH"}
+    markers = [{"sha": "head", "issues": [issue]}]
+    dispositions = [{
+        "fingerprint": "abc", "status": "withdrawn",
+        "evidence": "The documented input grammar excludes inline comments; no supported producer emits them.",
+    }]
+    assert P.review_prior_state(markers, dispositions) == []
+
+
+def test_unreadable_prior_reviews_stop_publication():
+    import review_post as P
+    from unittest.mock import patch
+    from subprocess import CompletedProcess
+
+    with patch.object(P, "_run", return_value=CompletedProcess([], 1, "", "API unavailable")):
+        try:
+            P.fetch_prior_markers("OWNER/REPO", 1)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("Unavailable prior state cannot be treated as a first review")
+
+
+def test_unresolved_state_survives_a_round_without_new_findings():
+    import review_post as P
+    old = {"fingerprint": "abc", "path": "x.py", "severity": "HIGH"}
+    body = P.summary_body([], "", head_sha="new", round_no=2, outstanding=[old])
+    assert "| 🟠 HIGH | 1 |" in body
+    marker = R.parse_state_marker(body)
+    assert marker["issues"] == [old]
+    assert P.review_prior_state([marker], [{"fingerprint": "abc", "status": "open"}]) == [old]
+    closed = P.summary_body([], "", head_sha="fixed", round_no=3, outstanding=[])
+    assert P.review_prior_state([marker, R.parse_state_marker(closed)], []) == []
+
+
+def test_summary_only_rereview_posts_unresolved_high_without_network():
+    import review_post as P
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    issue = {"fingerprint": "abc", "severity": "HIGH"}
+    with patch.object(P, "load_findings", return_value=([], "", [{"fingerprint": "abc", "status": "open"}])), patch.object(
+        P, "fetch_prior_markers", return_value=[{"sha": "old", "issues": [issue]}]
+    ), patch.object(P, "fetch_pr_meta", return_value={"headRefOid": "new", "state": "OPEN"}), patch.object(
+        P, "fetch_diff", return_value=DIFF
+    ), patch.object(P, "post_summary_review", return_value=True) as post, contextlib.redirect_stdout(io.StringIO()):
+        assert P.main(["--repo", "OWNER/REPO", "--pr", "1", "--commit", "new", "--findings", "unused", "--no-wiki-links"]) == 0
+    assert post.call_args.args[3] == "REQUEST_CHANGES"
+    assert R.parse_state_marker(post.call_args.args[2])["issues"] == [issue]
+
+
+def test_clean_first_review_records_head_without_approving():
+    import review_post as P
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    with patch.object(P, "load_findings", return_value=([], "", [])), patch.object(
+        P, "fetch_prior_markers", return_value=[]
+    ), patch.object(P, "fetch_pr_meta", return_value={"headRefOid": "head", "state": "OPEN"}), patch.object(
+        P, "fetch_diff", return_value=DIFF
+    ), patch.object(P, "post_summary_review", return_value=True) as post, contextlib.redirect_stdout(io.StringIO()):
+        assert P.main(["--repo", "OWNER/REPO", "--pr", "1", "--commit", "head", "--findings", "unused", "--no-wiki-links"]) == 0
+    assert post.call_args.args[3] == "COMMENT"
+    assert R.parse_state_marker(post.call_args.args[2]) == {"sha": "head", "findings": [], "issues": [], "round": 1}
+
+
 # bare-python runner
 # --------------------------------------------------------------------------- #
 

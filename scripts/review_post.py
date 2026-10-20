@@ -195,7 +195,8 @@ SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵"}
 
 
 def summary_body(findings: list, model_summary: str, skipped: list = (),
-                 head_sha: str | None = None, round_no: int | None = None) -> str:
+                 head_sha: str | None = None, round_no: int | None = None,
+                 outstanding: list | None = None) -> str:
     """Deterministic part of the review body: heading + severity count table.
 
     Everything judgement-flavoured — verdict prose, per-file overview, analysis
@@ -207,13 +208,15 @@ def summary_body(findings: list, model_summary: str, skipped: list = (),
     state marker records the reviewed head and the findings for the next round.
     """
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    for f in findings:
+    for f in findings + (outstanding or []):
         sev = str(f.get("severity", "MEDIUM")).upper()
         # unknown severity is coerced to MEDIUM, matching build_comment_body
         counts[sev if sev in counts else "MEDIUM"] += 1
     lines = [f"## Code Review — {round_no}회차" if round_no and round_no > 1 else "## Code Review", ""]
     if model_summary:
         lines += [model_summary.strip(), ""]
+    if outstanding:
+        lines += [f"Unresolved findings from earlier reviews: {len(outstanding)}.", ""]
     lines += ["| 심각도 | 건수 |", "|--------|------|"]
     for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
         lines.append(f"| {SEV_ICON[s]} {s} | {counts[s]} |")
@@ -227,7 +230,7 @@ def summary_body(findings: list, model_summary: str, skipped: list = (),
             if expl:
                 lines += ["", "  " + expl.replace("\n", "\n  "), ""]
     if head_sha:
-        lines += ["", R.state_marker(head_sha, findings, round_no)]
+        lines += ["", R.state_marker(head_sha, findings, round_no, outstanding)]
     return "\n".join(lines)
 
 
@@ -238,13 +241,11 @@ def summary_only_plan(event: str, findings: list, model_summary: str):
     posting the real run then skips. That mismatch is the whole reason this is a
     function and not an `if` in each branch.
 
-    APPROVE is the one event that is never posted, which is what stops a self-
-    approval. With no findings it is also the event `decide_event` picks, so a
-    summary-only review takes an explicit `--event COMMENT` and never happens by
-    accident.
+    Empty reviews default to COMMENT and record the reviewed head. Explicit
+    APPROVE requests are rejected so this tool cannot approve a PR automatically.
     """
     if event == "APPROVE":
-        return False, "이슈 없음 — 게시 생략(콘솔만). 요약만 남기려면 --event COMMENT."
+        return False, "Automatic approval is disabled; use COMMENT."
     if findings:
         return True, f"인라인 앵커 없음(전부 skip) — 요약 리뷰만 게시 (event={event})."
     if model_summary:
@@ -280,7 +281,7 @@ def print_console(payload: dict, skipped: list, warns: list, dry: bool,
 
 def plan_review(repo: str, pr: int, findings: list, model_summary: str,
                 event: str | None, commit: str | None,
-                round_no: int | None = None) -> tuple:
+                round_no: int | None = None, outstanding: list | None = None) -> tuple:
     """Build the payload against the live PR. Returns (payload, skipped, warns, blockers).
 
     `blockers` are reasons not to post at all: the head moved past the reviewed
@@ -298,14 +299,15 @@ def plan_review(repo: str, pr: int, findings: list, model_summary: str,
         print("경고: --commit 없음 — 리뷰 중 push가 있었다면 줄 번호가 어긋날 수 있음")
 
     diffmap = R.parse_diff(fetch_diff(repo, pr))
-    payload, skipped, warns = R.build_review_payload(findings, diffmap, "", event=event)
+    verdict = R.decide_event(findings + (outstanding or []))
+    payload, skipped, warns = R.build_review_payload(findings, diffmap, "", event=event or verdict)
     own = bool(meta.get("viewer")) and \
         meta.get("viewer") == (meta.get("author") or {}).get("login")
     payload["event"], note = R.event_for_author(payload["event"], own)
     if note:
         print(note)
     payload["commit_id"] = head
-    payload["body"] = summary_body(findings, model_summary, skipped, head, round_no)
+    payload["body"] = summary_body(findings, model_summary, skipped, head, round_no, outstanding)
     return payload, skipped, warns, blockers
 
 
@@ -325,8 +327,7 @@ def fetch_prior_markers(repo: str, pr: int) -> list:
     """State markers this skill left on the PR's earlier reviews, oldest first."""
     p = _run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{pr}/reviews"], check=False)
     if p.returncode != 0:
-        print(f"경고: 이전 리뷰를 읽지 못함 — 1회차로 진행: {p.stderr.strip()[:160]}")
-        return []
+        raise SystemExit(f"Cannot read prior review state; refusing to assume round 1: {p.stderr.strip()[:160]}")
     markers = []
     for review in _json_pages(p.stdout):
         m = R.parse_state_marker(review.get("body") or "")
@@ -340,12 +341,38 @@ def apply_rounds(findings: list, markers: list, forced: int | None) -> tuple:
     round_no = forced or R.review_round(markers)
     prior = {fp for m in markers for fp in m.get("findings", [])}
     kept, dropped = R.apply_round_policy(findings, round_no, prior)
-    print(f"{round_no}회차 리뷰 (이전 마커 {len(markers)}개, 신규 지적 하한 "
-          f"{R.round_floor(round_no) or '없음'})")
+    print(f"Review round {round_no} (prior markers: {len(markers)}; no severity floor)")
     for f, why in dropped:
         print(f"  제외 [{str(f.get('severity', '?')).upper()}] "
               f"{f.get('path')}:{f.get('line')} {f.get('title', '')} — {why}")
     return kept, round_no
+
+
+def review_prior_state(markers: list, dispositions: list) -> list:
+    """Require a disposition for each outstanding issue before computing a verdict."""
+    if not markers:
+        return []
+    if "issues" in markers[-1]:
+        prior = {f["fingerprint"]: f for f in markers[-1]["issues"]}
+    else:
+        # Legacy markers record no severity or resolution state.
+        prior = {fp: {"fingerprint": fp, "severity": "HIGH"}
+                 for marker in markers for fp in marker.get("findings", [])}
+    decisions = {d["fingerprint"]: d for d in dispositions}
+    if set(prior) != set(decisions) or len(decisions) != len(dispositions):
+        raise ValueError("_prior_findings must contain exactly one disposition per outstanding fingerprint")
+    outstanding = []
+    for fp, issue in prior.items():
+        decision = decisions[fp]
+        status = decision.get("status")
+        if status not in {"fixed", "open", "rebutted-accepted", "rebutted-rejected", "outdated", "unverified", "withdrawn"}:
+            raise ValueError(f"Invalid prior finding status: {status}")
+        if status in {"fixed", "rebutted-accepted", "withdrawn"}:
+            if not str(decision.get("evidence") or "").strip():
+                raise ValueError(f"Closing {fp} requires code or contract evidence")
+            continue
+        outstanding.append(issue)
+    return outstanding
 
 
 def load_findings(path: str) -> tuple:
@@ -353,12 +380,15 @@ def load_findings(path: str) -> tuple:
     data = json.loads(raw)
     model_summary = ""
     findings = []
+    dispositions = []
     for item in data:
         if "_summary" in item:
             model_summary = item["_summary"]
+        elif "_prior_findings" in item:
+            dispositions.extend(item["_prior_findings"])
         else:
             findings.append(item)
-    return findings, model_summary
+    return findings, model_summary, dispositions
 
 
 def main(argv=None):
@@ -385,7 +415,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
-    findings, model_summary = load_findings(args.findings)
+    findings, model_summary, dispositions = load_findings(args.findings)
 
     # No PR number -> local review, force dry-run (never posts).
     dry = args.dry_run or args.pr is None
@@ -418,9 +448,13 @@ def main(argv=None):
         return 0
 
     markers = [] if args.fresh else fetch_prior_markers(repo, args.pr)
+    try:
+        outstanding = review_prior_state(markers, dispositions)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     findings, round_no = apply_rounds(findings, markers, 1 if args.fresh else args.round)
     payload, skipped, warns, blockers = plan_review(
-        repo, args.pr, findings, model_summary, args.event, args.commit, round_no)
+        repo, args.pr, findings, model_summary, args.event, args.commit, round_no, outstanding)
     head, body = payload["commit_id"], payload["body"]
 
     for b in blockers:
@@ -431,7 +465,7 @@ def main(argv=None):
     if dry:
         print_console(payload, skipped, warns, dry=True, wiki_warns=wiki_warns)
         if not payload["comments"]:
-            print(summary_only_plan(payload["event"], findings, model_summary)[1])
+            print(summary_only_plan(payload["event"], findings, body)[1])
         return 0
 
     if not payload["comments"]:
@@ -439,7 +473,7 @@ def main(argv=None):
         # posting: a pass that reached a verdict belongs on the PR, not in a console
         # nobody else reads. `summary_only_plan` decides, and the dry run above printed
         # the same decision.
-        post, reason = summary_only_plan(payload["event"], findings, model_summary)
+        post, reason = summary_only_plan(payload["event"], findings, body)
         print(reason)
         if post and not post_summary_review(repo, args.pr, body, payload["event"], head):
             return 1

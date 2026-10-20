@@ -17,8 +17,7 @@ Responsibilities (all pure functions, no network, no file I/O):
   7. event_for_author()      GitHub rejects REQUEST_CHANGES on your own PR
   8. review_round() / apply_round_policy()
                              which round this review is, and which findings it may
-                             still post: no repeats, and a severity floor that rises
-                             with the round so a deeper review still converges
+                             still post: no repeated inline findings
 
 The GitHub "Create a review" API accepts line-based coordinates
 (path, line, side, start_line, start_side) inside comments[], so a single
@@ -130,6 +129,7 @@ class Anchor:
     start_side: Optional[str] = None
     warnings: list = field(default_factory=list)
     valid: bool = True
+    adjusted: bool = False
 
     def to_comment_fields(self) -> dict:
         d = {"path": self.path, "line": self.line, "side": self.side}
@@ -213,6 +213,8 @@ def resolve_anchor(fd: FileDiff, finding: dict) -> Anchor:
             anchor.start_line = start_line
             anchor.start_side = start_side
 
+    anchor.adjusted = (anchor.line != int(finding["line"])
+                       or anchor.start_line != finding.get("start_line"))
     return anchor
 
 
@@ -319,14 +321,16 @@ def build_comment_body(finding: dict, fd: Optional[FileDiff] = None,
         parts.append(explanation)
 
     sugg = finding.get("suggestion")
+    if sugg and anchor is not None and (
+        anchor.adjusted
+        or anchor.side != "RIGHT"
+        or anchor.start_side not in (None, "RIGHT")
+    ):
+        anchor.warnings.append(
+            f"{anchor.path}:{anchor.line} suggestion removed: coordinates changed or LEFT side is not applyable")
+        sugg = None
     if sugg:
         lines = sugg.splitlines() if isinstance(sugg, str) else list(sugg)
-        if anchor is not None and anchor.side == "LEFT":
-            # a LEFT-anchored line no longer exists in the new file, so GitHub
-            # renders the fence but the Apply button can never work
-            anchor.warnings.append(
-                f"{anchor.path}:{anchor.line} suggestion anchored on LEFT (deleted "
-                "line) — not applyable; describe the fix in explanation instead")
         if (anchor is not None and anchor.start_line is not None
                 and anchor.start_side == "RIGHT" and anchor.side == "RIGHT"):
             span = anchor.line - anchor.start_line + 1
@@ -366,7 +370,7 @@ def decide_event(findings: list) -> str:
         return "REQUEST_CHANGES"
     if findings:
         return "COMMENT"
-    return "APPROVE"
+    return "COMMENT"
 
 
 def build_review_payload(findings: list, diffmap: dict, summary_body: str,
@@ -439,7 +443,8 @@ def parse_fingerprint_marker(body: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def state_marker(head_sha: str, findings: list, round_no: Optional[int] = None) -> str:
+def state_marker(head_sha: str, findings: list, round_no: Optional[int] = None,
+                 outstanding: Optional[list] = None) -> str:
     """Hidden line for the review body: the head this round reviewed and its findings.
 
     The next round reads it back to diff only `sha..HEAD` and to give a verdict on
@@ -448,6 +453,13 @@ def state_marker(head_sha: str, findings: list, round_no: Optional[int] = None) 
     data: dict = {"sha": head_sha, "findings": sorted({fingerprint(f) for f in findings})}
     if round_no is not None:
         data["round"] = round_no
+    if outstanding is not None:
+        issues = {f.get("fingerprint") or fingerprint(f): f for f in outstanding + findings}
+        data["issues"] = [
+            {**{k: f[k] for k in ("path", "line", "title", "category", "severity") if k in f},
+             "fingerprint": fp}
+            for fp, f in sorted(issues.items())
+        ]
     return f"<!-- pr-inline-review:v1 {json.dumps(data, separators=(',', ':'))} -->"
 
 
@@ -478,9 +490,6 @@ def event_for_author(event: str, own_pr: bool) -> tuple:
 # review rounds
 # --------------------------------------------------------------------------- #
 
-_SEV_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-
-
 def review_round(markers: list) -> int:
     """One past the rounds already on the PR.
 
@@ -491,35 +500,16 @@ def review_round(markers: list) -> int:
     return max([len(markers)] + recorded) + 1
 
 
-def round_floor(round_no: int) -> Optional[str]:
-    """The lowest severity a NEW finding may have in this round.
-
-    Round 1 has none. Later rounds look deeper, and a deeper look always finds
-    more nits; without a rising floor the review never converges.
-    """
-    if round_no <= 1:
-        return None
-    return "MEDIUM" if round_no == 2 else "HIGH"
-
-
 def apply_round_policy(findings: list, round_no: int, prior_fps: set) -> tuple:
     """Returns (kept, dropped), dropped as (finding, reason).
 
     A finding already raised in an earlier round is answered in its own thread,
-    not posted again. A new finding below the round's floor is dropped unless it
-    says the increment since the last review introduced it
-    (`introduced_by_increment: true`): fresh code gets a first review at any level.
+    not posted again. New findings are retained at every severity.
     """
-    floor = round_floor(round_no)
     kept, dropped = [], []
     for f in findings:
         if fingerprint(f) in prior_fps:
             dropped.append((f, "an earlier round raised it; answer in that thread"))
-            continue
-        sev = str(f.get("severity", "MEDIUM")).upper()
-        if floor and _SEV_RANK.get(sev, 1) < _SEV_RANK[floor] \
-                and not f.get("introduced_by_increment"):
-            dropped.append((f, f"below the round-{round_no} floor ({floor})"))
             continue
         kept.append(f)
     return kept, dropped
