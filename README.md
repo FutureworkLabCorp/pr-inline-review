@@ -10,6 +10,20 @@ Install this skill beside `code-review-sweep`. `scripts/sweep.py` delegates to t
 skill's canonical engine and `patterns.toml`, so both review entry points use the
 same patterns. Design judgement references remain in `reference/`.
 
+Install `review-rediagnose` alongside both skills to enable independent re-diagnosis
+of repeated patch cycles. The shared skills are maintained in
+[FutureworkLabCorp/skills](https://github.com/FutureworkLabCorp/skills); initialize
+its submodules when cloning that repository. A clone of this repository alone does
+not include the required discovery engine or qualification gate.
+
+`scripts/setup_check.py` checks these sibling paths before checking GitHub access.
+Missing `code-review-sweep/sweep.py` or `finding-gate.md` fails setup. Missing
+`review-rediagnose/SKILL.md` warns without blocking ordinary review. If recurrence
+requires the absent skill, tell the user and pause only the dependent fix
+recommendations; keep unresolved findings and continue unrelated review. Do not
+claim an independent pass occurred, replace it with parent self-review, or install
+dependencies during a review.
+
 Discovery reports candidate hits, manually reviewed categories, removed guarantees
 and changed routines. Read each changed routine and verify every candidate against
 callers, guards and shared mechanisms. Matching text elsewhere does not establish
@@ -122,6 +136,7 @@ Run the standalone helper tests without application databases or LLM services:
 uv run python "$SKILL_DIR/tests/test_diff_map.py"
 uv run python "$SKILL_DIR/tests/test_wiki_links.py"
 uv run python "$SKILL_DIR/tests/test_sweep.py"
+uv run python "$SKILL_DIR/tests/test_setup_check.py"
 uv run python "$SKILL_DIR/../code-review-sweep/tests/test_sweep.py"
 ```
 
