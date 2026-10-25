@@ -10,6 +10,7 @@ Run first when a review misbehaves. Cross-platform (uses `python`, not `python3`
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -39,13 +40,30 @@ def check(label, ok, detail=""):
     return ok
 
 
+def check_skill_dependencies(skill_dir):
+    skills_dir = Path(skill_dir).resolve().parent
+    ok = True
+    for name in ("sweep.py", "finding-gate.md"):
+        path = skills_dir / "code-review-sweep" / name
+        ok &= check(f"required review dependency: {name}", path.is_file(), str(path))
+
+    rediagnose = skills_dir / "review-rediagnose" / "SKILL.md"
+    if rediagnose.is_file():
+        check("independent re-diagnosis available", True, str(rediagnose))
+    else:
+        print(f"  [WARN] Independent re-diagnosis unavailable: {rediagnose}")
+        print("         Install review-rediagnose beside this skill from FutureworkLabCorp/skills.")
+        print("         Continue ordinary review; pause dependent fix recommendations when recurrence triggers apply.")
+    return ok
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", help="also verify the active gh account can see this repo")
     args = ap.parse_args(argv)
 
     print("pr-inline-review · setup check\n")
-    ok = True
+    ok = check_skill_dependencies(Path(__file__).resolve().parents[1])
 
     # 1. python >= 3.8 (dataclasses, f-strings)
     ok &= check(f"python {sys.version.split()[0]}",

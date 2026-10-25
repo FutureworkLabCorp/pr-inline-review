@@ -41,6 +41,13 @@ description: >
 python scripts/setup_check.py --repo <OWNER/REPO>
 ```
 
+The setup check requires the sibling `code-review-sweep` engine and gate. It warns
+if the optional `review-rediagnose` skill is missing. When recurrence requires that
+skill, report its absence and pause only dependent fix recommendations; preserve
+unresolved findings and continue unrelated review. Do not claim independence from
+parent self-review or install dependencies during review. See `README.md` for the
+shared installation source and layout.
+
 `gh` 설치·인증·**active 계정의 org 접근 권한**·python 버전을 확인한다.
 org 저장소인데 "Could not resolve repository"가 나오면 대개 active 계정 문제:
 ```bash
@@ -122,6 +129,29 @@ query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)
 2. **이전 finding마다 판정** (빠짐없이): `fixed`(코드로 확인, 고친 커밋 명시) / `open`(그대로) / `rebutted-accepted`(작성자 반박이 맞음) / `rebutted-rejected`(반박이 틀림, 근거 제시) / `outdated`(코드가 사라져 판정 불가). 작성자의 "Addressed in <sha>" 답글은 주장일 뿐이다 — 그 커밋의 코드를 읽고 판정한다.
 3. **스레드 답글:** `fixed`·`rebutted-*`는 해당 스레드에 한두 문장으로 답한다(`gh api repos/<REPO>/pulls/<PR>/comments/<첫 코멘트 databaseId>/replies -f body=...`). 같은 지적을 새 코멘트로 다시 달지 않는다.
 4. **새 finding:** 기본 절차는 증분 diff에서만 돈다(Step 3-A 스윕도 `--base <marker.sha>`). 그 위에 아래 "회차별 깊이"의 심화 패스가 PR 전체를 본다. 증분이 새로 만든 문제는 finding에 `"introduced_by_increment": true`를 단다.
+
+Before finalizing these dispositions and new findings, apply the shared gate's
+"Repeated topics and stopping" and "Fix recommendations and closure" sections.
+Distinguish a missed independent defect, the same cause with a changed symptom, a
+fix-induced regression and an expanding requirement. Keep the same cause in its
+existing thread and retain its prior fingerprint for the disposition; do not create
+a new issue merely because its title or location changed. Distinct regressions
+remain independently reportable. Keep a short working record for recurring issues,
+reconstructed from threads and code when necessary; reconcile it only after neutral
+discovery. This record is not an additional findings JSON object or marker field.
+When the shared gate's recurrence triggers apply, invoke the sibling
+[review-rediagnose](../review-rediagnose/SKILL.md) before another dependent fix
+recommendation, regardless of severity or depth. Follow its fresh-agent Stage A
+investigation before revealing fix history for Stage B, then reconcile the result
+into the existing dispositions. Keep reports local and use normal candidate
+verification and posting for resulting findings; no new JSON fields are needed.
+
+Mark `fixed` only with evidence that the original failure path is corrected at the
+current head and the nearby supported behavior remains intact. Cite the fixing
+commit and test/reproduction result when practical, otherwise the concrete source
+trace and execution limits. A moved symptom remains `open`; insufficient evidence
+is `unverified`. A resolved thread or changed line alone does not establish closure.
+
 5. Add a `_prior_findings` JSON entry with exactly one disposition per outstanding
    fingerprint. Use the latest marker's `issues`; for older markers without that
    field, take the union of their `findings`. Each disposition has `fingerprint`
@@ -166,6 +196,9 @@ only where sweep results or changed contracts justify them, and label them as
 targeted rather than neutral. Reconcile by root cause before candidate verification.
 If the same requirement attracts successive defensive fixes, apply the shared
 gate's stopping rule before recommending another rewrite.
+In particular, two fixes sharing a premise that fail the same behavioral check
+trigger a test of that premise before a third recommendation. This changes the
+investigation, not the severity floor or the obligation to report verified defects.
 
 ---
 
@@ -371,6 +404,9 @@ realistic input production, supported-workflow impact and correction cost. Only
 CONFIRMED + ACTIONABLE becomes a finding; factual truth alone is insufficient.
 If sources conflict or repeated fixes keep broadening the same requirement, pause
 that fix chain and identify the decision needed. Do not invent more input grammar.
+Use the shared fix criteria for suggestions too: recommend the smallest complete
+correction at the demonstrated owner. Omit an unverified patch suggestion rather
+than hiding an unknown cause behind another guard; the confirmed finding can remain.
 
 **초안을 그대로 올리지 않는다.** Step 5의 후보 전체를 한 번에 놓고, 각 항목을 **적대적으로 다시 검증**한다. "내가 지적한 게 진짜 문제인가"를 스스로 반박해 보는 단계다. 리뷰봇 신뢰를 가장 크게 깎는 게 그럴듯하지만 틀린 지적이므로, 이 게이트가 체감 품질을 좌우한다.
 
