@@ -5,8 +5,8 @@ description: >
   then post verified findings as inline comments. Use for PR reviews, re-reviews
   and dry runs. Shared code-review-sweep discovery lists candidate defects,
   deleted guards and changed routines; later rounds add independent gap analysis,
-  callers two hops out and focused tests. Verified defects remain reportable at
-  every severity. Tested helpers handle anchors, suggestions, deduplication and
+  callers two hops out and focused tests. When PR edits are authorized, apply
+  obvious small corrections and report unresolved defects and consequential risks. Tested helpers handle anchors, suggestions, deduplication and
   unresolved finding state without automatically approving a PR.
 ---
 
@@ -15,7 +15,9 @@ description: >
 이 스킬의 원칙: **모델은 "무엇을 지적할지"만 판단하고, "어디에 어떻게 붙일지"(line/side/줄수/suggestion 펜스/API)는 절대 손으로 계산하지 않는다.**
 좌표·게시는 `scripts/review_post.py`가 diff를 파싱해 결정적으로 처리한다 (인라인 실수의 원천 제거).
 
-모델이 만들어 내는 산출물은 단 하나 — **구조화된 findings JSON**. 그게 전부다.
+The posting helper consumes structured findings JSON. When PR modification is
+already authorized, also apply small corrections under the shared handling policy
+in `../code-review-sweep/finding-gate.md`; summarize completed cleanup once.
 
 ---
 
@@ -239,7 +241,9 @@ grep -rn "함수명\|클래스명" src/ --include="*.py" -l
 - in-memory 캐시 vs DB/Redis 로드 경로의 타입이 일치하나?
 
 3-3. **기존 패턴 대조:** `grep -rn "pattern" src/` — 새 코드가 기존 패턴을 따르나, 불일치 추상화를 들여오나.
-3-4. **테스트 갭:** 새 `+` 코드 경로(분기·루프·early return)를 열거하고 테스트 존재 여부 매핑. 미커버는 LOW/MEDIUM.
+3-4. **Test gaps:** map changed behavior to relevant tests. Missing coverage is an
+investigation lead; report a finding only with a consequential unverified behavior,
+not merely an uncovered branch.
 3-5. **외부 스토리지 값의 단위·타입을 주장하는 이슈**라면, 그 write 경로를 grep으로 확인한 뒤 리포트 (단위 오해 false-positive 방지).
 
 정확성 밖의 네 관점. 코드가 맞아도 이 변경이 있어야 하는지, 이 모양이어야 하는지를 본다.
@@ -321,6 +325,10 @@ This shared gate applies to every severity and category, including bug/regressio
 It requires contract evidence, credible inputs, a material consequence and a
 proportionate correction. Reproduction alone does not qualify a finding.
 Category heuristics generate candidates only; the shared gate controls eligibility.
+Apply its "Handling small corrections and hard-to-reverse changes" policy before
+creating findings: fix authorized obvious cleanup, omit low-value advice, and lead
+the summary with concrete effects that code rollback cannot undo. If edits update
+the PR, refresh its pinned head, affected evidence and posting anchors first.
 Check existing threads by invariant, root cause and affected workflow before exact
 fingerprint deduplication; a retitled version of the same claim stays in its thread.
 
@@ -476,7 +484,8 @@ python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --fin
 - 인라인으로 달지 못한(skip된) finding은 리뷰 본문 "인라인에 달지 못한 지적" 소절에 내용째 싣는다 — 집계표 숫자로만 남지 않는다.
 - 리뷰 본문 끝에 상태 마커(리뷰한 head SHA + finding fingerprint 목록 + 회차)를, 인라인 코멘트마다 fingerprint 마커를 숨겨 붙인다. 다음 라운드의 Step 1-R이 이것을 읽는다.
 - **Round policy:** read markers to determine the round and deduplicate repeated
-  inline findings. Never suppress a verified defect because of severity or depth.
+  inline findings. Keep unresolved verified behavioral defects reportable at any
+  severity or depth; completed minor cleanup belongs in one summary, not new threads.
   `--round` corrects recorded round metadata; `--fresh` deliberately starts a new
   review without prior-state tracking. Do not use it to bypass unresolved findings.
 - **line 기반 단일 배치**로 `/pulls/{pr}/reviews`에 1회 게시 (position 안 씀).
