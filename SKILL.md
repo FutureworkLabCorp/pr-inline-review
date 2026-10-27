@@ -327,7 +327,7 @@ proportionate correction. Reproduction alone does not qualify a finding.
 Category heuristics generate candidates only; the shared gate controls eligibility.
 Apply its "Handling small corrections and hard-to-reverse changes" policy before
 creating findings: fix authorized obvious cleanup, omit low-value advice, and lead
-the summary with concrete effects that code rollback cannot undo. If edits update
+Merge Danger with concrete effects that code rollback cannot undo. If edits update
 the PR, refresh its pinned head, affected evidence and posting anchors first.
 Check existing threads by invariant, root cause and affected workflow before exact
 fingerprint deduplication; a retitled version of the same claim stays in its thread.
@@ -366,11 +366,16 @@ fingerprint deduplication; a retitled version of the same claim stays in its thr
 
 ## Step 5. findings 초안 작성
 
-지적 후보를 **리스트**로 정리한다(아직 최종본 아님 — Step 6에서 걸러진다). 첫 원소로 `_summary`(선택)를 넣을 수 있다 — 리뷰 본문에 들어갈 **자유 markdown**으로, PR 개요·verdict 산문·인라인로 안 가는 non-blocking 언급을 여기에 쓴다. 요약 산문은 모델의 몫이고, 스크립트는 그 뒤에 심각도 집계표만 결정적으로 부착한다.
+Draft candidates as a list; Step 6 qualifies them before publication. Include a
+`_summary` entry with **Summary** and **Merge Danger**, following the shared gate's
+"Review summary and Merge Danger" section. Add a minimal diagram, diff sketch or
+tree only when it helps explain the change. Put a blocking verdict first when needed.
+The helper accepts this as free Markdown and appends the severity counts; no new
+posting fields are needed. Include the overview even when no findings survive.
 
 ```json
 [
-  {"_summary": "OCR 실패 알림 dedup 누락 + 초대 read_at 시맨틱 점검.\n\n**머지 전 HIGH 1건 해결 필요.** 나머지는 non-blocking."},
+  {"_summary": "**Resolve the notification deduplication defect before merge.**\n\n## Summary\nThe PR changes how OCR failure notifications are grouped.\n\n## Merge Danger\nCode rollback cannot remove duplicate notifications already persisted. The affected notification rows need cleanup; recovery has not been verified."},
   {
     "path": "src/app/notifications/service.py",
     "line": 142,
