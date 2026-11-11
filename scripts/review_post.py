@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 review_post.py — post (or dry-run) a GitHub inline review from structured findings.
 

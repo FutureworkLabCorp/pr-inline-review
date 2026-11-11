@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Use the canonical discovery engine from the sibling code-review-sweep skill."""
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23", "jedi>=0.19"]
+# ///
+"""Use the canonical discovery engine from the sibling code-review-sweep skill.
+
+The metadata above repeats the engine's, because `uv run --script` reads only this file."""
 
 import importlib.util
 from pathlib import Path

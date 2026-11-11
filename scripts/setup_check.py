@@ -1,11 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 setup_check.py — verify the environment before running a review.
 
-Run first when a review misbehaves. Cross-platform (uses `python`, not `python3`).
+Run first when a review misbehaves. `uv run` works where `python` or `python3` is missing.
 
-    python scripts/setup_check.py
-    python scripts/setup_check.py --repo OWNER/REPO   # also check repo access
+    uv run --no-project python scripts/setup_check.py
+    uv run --no-project python scripts/setup_check.py --repo OWNER/REPO   # also check repo access
 """
 from __future__ import annotations
 
@@ -69,6 +69,11 @@ def main(argv=None):
     ok &= check(f"python {sys.version.split()[0]}",
                 sys.version_info >= (3, 8),
                 "need >= 3.8")
+
+    # 1b. uv runs the discovery sweep on its own Python 3.11+ (the script's inline metadata)
+    uv = shutil.which("uv")
+    ok &= check("uv installed (runs the discovery sweep)", bool(uv),
+                uv or "install: https://docs.astral.sh/uv/")
 
     # 2. gh installed
     gh = shutil.which("gh")
