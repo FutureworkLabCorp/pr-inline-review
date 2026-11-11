@@ -34,7 +34,7 @@ not a finding: most are benign, and each one gets a verdict.
 | `UNSAFE-CAST` (ts) | An `as` assertion (not `as const`) — does it launder a real type mismatch the compiler would otherwise catch? `as unknown as X` and `as any` are the loudest. |
 | `ANY-ESCAPE` (ts) | `any` disables all downstream type-checking. Prefer `unknown` + narrowing. |
 | `NON-NULL-ASSERT` (ts) | `foo!.bar` swallows a real `null`/`undefined` at runtime. Is the value guaranteed non-null here? |
-| `TS-SUPPRESS` (ts) | `@ts-ignore` / `@ts-nocheck` — justified with a reason, or masking a real bug? Prefer `@ts-expect-error` scoped to one line. |
+| `TS-SUPPRESS` (ts) | `@ts-ignore` / `@ts-nocheck` / `eslint-disable` — is the reason recorded where the repository's rules require, and does the silenced rule protect something here, or is it masking a real bug? Prefer `@ts-expect-error` and a disable scoped to one line and one rule. |
 | `DANGER-HTML` (ts) | `dangerouslySetInnerHTML` — is the HTML sanitized / from a trusted source? |
 | `EFFECT-DEPS` · `HOOK-RULES` (ts, eslint) | A missing dep (stale closure) or a conditionally-called hook. Deliberate and safe? |
 | `UNAWAITED-PROMISE` · `MISUSED-PROMISE` (ts, eslint) | A floating promise or a promise passed where a sync callback is expected. |
