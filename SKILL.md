@@ -40,7 +40,8 @@ in `../code-review-sweep/finding-gate.md`; summarize completed cleanup once.
 ## Step S. 셋업 체크 (최초 1회 / 문제 발생 시)
 
 ```bash
-python scripts/setup_check.py --repo <OWNER/REPO>
+SKILL_DIR=<이 SKILL.md가 있는 디렉토리의 절대경로>
+uv run --no-project python "$SKILL_DIR/scripts/setup_check.py" --repo <OWNER/REPO>
 ```
 
 The setup check requires the sibling `code-review-sweep` engine and gate. It warns
@@ -50,7 +51,7 @@ unresolved findings and continue unrelated review. Do not claim independence fro
 parent self-review or install dependencies during review. See `README.md` for the
 shared installation source and layout.
 
-`gh` 설치·인증·**active 계정의 org 접근 권한**·python 버전을 확인한다.
+`gh` 설치·인증·**active 계정의 org 접근 권한**·python 버전·uv 설치를 확인한다.
 org 저장소인데 "Could not resolve repository"가 나오면 대개 active 계정 문제:
 ```bash
 gh auth switch --user <org 권한 있는 handle>
@@ -64,18 +65,18 @@ gh auth switch --user <org 권한 있는 handle>
 
 ```bash
 # PR이 규칙 문서 자체를 바꿨을 수 있으니 base 브랜치 판본을 기준으로 삼는다
-# BASE = PR의 baseRefName (gh pr view <PR> --json baseRefName), 로컬 리뷰면 develop
+# BASE = PR의 baseRefName (gh pr view <PR> --json baseRefName),
+#        로컬 리뷰면 원격 기본 브랜치 (git symbolic-ref --short refs/remotes/origin/HEAD)
 git fetch origin "$BASE" -q
-git show "origin/$BASE:AGENTS.md"                 # 1순위: Agent/리뷰 지침 (정본)
-git show "origin/$BASE:.docs/Code-Conventions.md" # 2순위: 컨벤션 전체 목록
-ls .docs/                                         # 나머지는 주제가 걸릴 때만
+git show "origin/$BASE:AGENTS.md"            # 1순위: Agent/리뷰 지침 (정본). 없으면 CLAUDE.md
+git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가리키는 컨벤션 문서
 ```
 
-`.docs/`의 나머지는 해당 주제가 diff에 있을 때만 읽는다: 테스트 갭이면 `Testing.md`, Cypher가 바뀌었으면 `Compatible-ArcadeDB.md`, 의존성·compose `image:`가 바뀌었으면 `Onprem-Licensing.md`. (`docs/`는 다른 용도의 디렉토리다 — 규칙 문서는 `.docs/`에 있다.)
+규칙 문서의 위치는 저장소마다 다르다(`docs/`, `.docs/`, 위키). AGENTS.md가 가리키는 곳을 따르고, 나머지 규칙 문서는 해당 주제가 diff에 있을 때만 읽는다(예: 테스트 갭이면 테스트 문서, 새 의존성이면 라이선스 문서). linkBrain-server는 규칙 문서를 `.docs/`에 둔다.
 
 메모할 기준: 최소 변경 원칙 / 기존 패턴 우선 / 보안·정확성·생명주기 우선 / 새 추상화는 real complexity를 제거할 때만 / 근거 없는 동의 금지.
 
-**규칙 위반 finding은 규칙을 인용한다.** "컨벤션 위반"이라고만 쓰지 않고, 근거가 된 문장을 가장 짧게 인용하고 출처(`.docs/Code-Conventions.md`의 해당 항목)를 단다. 그 규칙이 이 파일 경로에 실제로 적용되는지(예: 상대 import 규칙은 `src/` 안에만) 확인한다. 인용할 문장을 못 찾으면 규칙 위반이 아니다 — 규칙 파일이 있다는 이유로 finding을 만들지 않는다. 반대로 PR이 규칙 문서·위키의 서술을 틀리게 만들면 그것도 finding이다(AGENTS.md: 문서가 틀려지면 고친다).
+**규칙 위반 finding은 규칙을 인용한다.** "컨벤션 위반"이라고만 쓰지 않고, 근거가 된 문장을 가장 짧게 인용하고 출처(규칙 문서와 그 항목)를 단다. 그 규칙이 이 파일 경로에 실제로 적용되는지(예: 상대 import 규칙은 `src/` 안에만) 확인한다. 인용할 문장을 못 찾으면 규칙 위반이 아니다 — 규칙 파일이 있다는 이유로 finding을 만들지 않는다. 반대로 PR이 규칙 문서·위키의 서술을 틀리게 만들면 그것도 finding이다(AGENTS.md: 문서가 틀려지면 고친다).
 
 **설계 패턴 레퍼런스(스킬 동봉):** `$SKILL_DIR/reference/patterns.md` — DB 컬럼 vs JSONB, hook/transaction 경계, ACL 적용 위치, RAG 파이프라인, lifecycle state machine 등 §1~§16 판단 기준. 전부 미리 읽지 말고 **Step 4에서 설계 판단이 걸리는 finding이 나올 때 해당 §만** 참조한다. (`$SKILL_DIR` = 이 SKILL.md가 있는 디렉토리의 절대경로)
 
@@ -191,7 +192,7 @@ controls investigation effort; the recorded round tracks published reviews only.
    the sweep and selects investigation paths. Reconcile with earlier findings after
    discovery; no findings is a valid result.
 2. **호출부 2홉.** `sweep.py ... --caller-depth 2`로 UNITS의 `callers2`를 받아, 반환 형태·예외·전제조건이 바뀐 함수만 호출부의 호출부까지 읽는다.
-3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 `uv run pytest <경로>`로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). `.env.pytest`나 DB가 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. `tests/evals/`는 돌리지 않는다(LLM·LangSmith 과금).
+3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: linkBrain-server의 과금되는 `tests/evals/`)는 돌리지 않는다.
 
 **Round 3+:** preserve an unseeded discovery pass. Add explicitly targeted passes
 only where sweep results or changed contracts justify them, and label them as
@@ -233,14 +234,14 @@ CUR=$(git rev-parse --abbrev-ref HEAD); echo "PR head=<headRefName> / current=$C
 3-1. 변경 함수/클래스의 **주변 전체 컨텍스트**(hunk 밖 포함, 클래스/모듈 구조, import) 읽기.
 3-2. **call-site 역추적**:
 ```bash
-grep -rn "함수명\|클래스명" src/ --include="*.py" -l
+git grep -n -l -e "함수명" -e "클래스명"   # 추적 파일 전체, 언어 무관
 ```
 타입 흐름 체크리스트:
 - `isinstance(x, str)` / `if x` 필터 → 실제 caller가 다른 타입(UUID 등)을 넣을 수 있나?
 - `json.dumps`↔`json.loads` 왕복 전후 타입이 바뀌나 (uuid.UUID→str)?
 - in-memory 캐시 vs DB/Redis 로드 경로의 타입이 일치하나?
 
-3-3. **기존 패턴 대조:** `grep -rn "pattern" src/` — 새 코드가 기존 패턴을 따르나, 불일치 추상화를 들여오나.
+3-3. **기존 패턴 대조:** `git grep -n "pattern"` — 새 코드가 기존 패턴을 따르나, 불일치 추상화를 들여오나.
 3-4. **Test gaps:** map changed behavior to relevant tests. Missing coverage is an
 investigation lead; report a finding only with a consequential unverified behavior,
 not merely an uncovered branch.
@@ -259,7 +260,7 @@ gh pr list --repo <REPO> --state open --json number,title,files \
 
 3-8. **YAGNI 대 최적화.** 변경이 일반화(값이 하나뿐인 설정, 구현이 하나뿐인 추상화, 아무도 넘기지 않는 인자, 쓰이지 않는 확장 지점)나 최적화(캐시, 배치, 동시성, 사전 계산)를 들여오면 둘을 비교하는 finding을 쓴다. explanation은 세 가지를 담는다: 지금 치르는 비용(복잡도·읽는 사람의 부담·새 실패 경로), 얻는다는 이득과 그 근거(측정, 호출 빈도, 요구사항), 그리고 권고. 근거 없는 일반화는 YAGNI가 이긴다(AGENTS.md "Prefer minimal, focused changes"). 측정 없는 최적화는 막지 말고 수치를 요청한다. 반대로 단순한 쪽이 분명한 병목(루프 안 쿼리, 반복 I/O)을 만들면 최적화를 권한다. category는 `design`, 보통 MEDIUM/LOW.
 
-3-9. **docstring·주석.** 스윕의 `DOC-*` HIT를 `reference/sweep-categories.md`대로 판정한다. 기준은 linkBrain-server `.docs/Code-Conventions.md` "Docstrings and comments"다: 코드가 말하지 못하는 것(왜 이 방식인지, 확인한 제약, 의존하는 외부 동작)만 남기고, 고친 경위·이전 동작·티켓 번호·시그니처 반복은 지운다. 길이 자체는 지적하지 않는다 — 지울 문장을 인용한다. 줄인 판본이 6줄 이하면 suggestion으로 단다. 이 변경이 쓰지 않은 기존 docstring은 대상이 아니다.
+3-9. **docstring·주석.** 스윕의 `DOC-*` HIT를 `reference/sweep-categories.md`대로 판정한다. 기준은 저장소의 주석 규칙이다(linkBrain-server는 `.docs/Code-Conventions.md` "Docstrings and comments"). 저장소 규칙이 더 엄격하면(예: "주석은 기본적으로 쓰지 않는다") 그것을 따르고, 규칙이 없으면 다음을 기본으로 한다: 코드가 말하지 못하는 것(왜 이 방식인지, 확인한 제약, 의존하는 외부 동작)만 남기고, 고친 경위·이전 동작·티켓 번호·시그니처 반복은 지운다. 길이 자체는 지적하지 않는다 — 지울 문장을 인용한다. 줄인 판본이 6줄 이하면 suggestion으로 단다. 이 변경이 쓰지 않은 기존 docstring은 대상이 아니다.
 
 ---
 
@@ -273,14 +274,15 @@ together. Keep scanner changes and pattern changes in `code-review-sweep` only.
 SKILL_DIR=<이 SKILL.md가 있는 디렉토리의 절대경로>
 
 # same-branch: 현재 워킹트리가 곧 PR head
-uv run python "$SKILL_DIR/scripts/sweep.py" --base "origin/$BASE"
+# uv run --script가 스크립트 메타데이터(Python 3.11+, tree-sitter, jedi)로 실행한다
+uv run --script "$SKILL_DIR/scripts/sweep.py" --base "origin/$BASE"
 
 # different-branch: 브랜치 전환 없이 PR head를 detached worktree로 materialize
 git fetch origin <PR_HEAD> -q
 WT=<worktree 경로>   # 아래 "worktree 위치" 참조
 git worktree add --detach "$WT" FETCH_HEAD -q
 MB=$(git merge-base "origin/$BASE" FETCH_HEAD)
-( cd "$WT" && uv run python "$SKILL_DIR/scripts/sweep.py" --base "$MB" )
+( cd "$WT" && uv run --script "$SKILL_DIR/scripts/sweep.py" --base "$MB" )
 ```
 
 The scanners and linters read working files. A base review requires those files
@@ -471,10 +473,10 @@ findings를 파일로 저장한 뒤:
 
 ```bash
 # dry-run (콘솔만, 게시 안 함)
-python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json --dry-run
+uv run --no-project python "$SKILL_DIR/scripts/review_post.py" --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json --dry-run
 
 # 실제 게시
-python scripts/review_post.py --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json
+uv run --no-project python "$SKILL_DIR/scripts/review_post.py" --repo <REPO> --pr <PR> --commit "$HEAD_SHA" --findings findings.json
 ```
 
 스크립트가 하는 일 (모델은 관여하지 않음):
