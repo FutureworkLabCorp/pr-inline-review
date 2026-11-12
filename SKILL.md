@@ -76,7 +76,7 @@ git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가�
 
 메모할 기준: 최소 변경 원칙 / 기존 패턴 우선 / 보안·정확성·생명주기 우선 / 새 추상화는 real complexity를 제거할 때만 / 근거 없는 동의 금지.
 
-**규칙 위반 finding은 규칙을 인용한다.** "컨벤션 위반"이라고만 쓰지 않고, 근거가 된 문장을 가장 짧게 인용하고 출처(규칙 문서와 그 항목)를 단다. 그 규칙이 이 파일 경로에 실제로 적용되는지(예: 상대 import 규칙은 `src/` 안에만) 확인한다. 인용할 문장을 못 찾으면 규칙 위반이 아니다 — 규칙 파일이 있다는 이유로 finding을 만들지 않는다. 반대로 PR이 규칙 문서·위키의 서술을 틀리게 만들면 그것도 finding이다(AGENTS.md: 문서가 틀려지면 고친다).
+**규칙 위반 finding은 규칙을 인용한다.** "컨벤션 위반"이라고만 쓰지 않고, 근거가 된 문장을 가장 짧게 인용하고 출처(규칙 문서와 그 항목)를 단다. 그 규칙이 이 파일 경로에 실제로 적용되는지(예: 상대 import 규칙은 `src/` 안에만) 확인한다. 인용할 문장을 못 찾으면 규칙 위반이 아니다 — 규칙 파일이 있다는 이유로 finding을 만들지 않는다. 반대로 PR이 규칙 문서·위키의 서술을 틀리게 만들면 그것도 finding이다(AGENTS.md: 문서가 틀려지면 고친다). 규칙이 강도를 나누면(강제 규칙과 판단 규칙), 판단 규칙에서 벗어난 이유가 규칙이 요구한 곳(PR 본문, 코드, 결정 문서)에 적혀 있으면 finding이 아니다. 올리기 전에 그곳을 확인한다. 규칙 문서가 "강제된다"고 해도 실제로 그 검사를 돌리는 lint·CI가 없으면 리뷰에서 확인한다.
 
 **설계 패턴 레퍼런스(스킬 동봉):** `$SKILL_DIR/reference/patterns.md` — DB 컬럼 vs JSONB, hook/transaction 경계, ACL 적용 위치, RAG 파이프라인, lifecycle state machine 등 §1~§16 판단 기준. 전부 미리 읽지 말고 **Step 4에서 설계 판단이 걸리는 finding이 나올 때 해당 §만** 참조한다. (`$SKILL_DIR` = 이 SKILL.md가 있는 디렉토리의 절대경로)
 
@@ -193,6 +193,7 @@ controls investigation effort; the recorded round tracks published reviews only.
    discovery; no findings is a valid result.
 2. **호출부 2홉.** `sweep.py ... --caller-depth 2`로 UNITS의 `callers2`를 받아, 반환 형태·예외·전제조건이 바뀐 함수만 호출부의 호출부까지 읽는다.
 3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: linkBrain-server의 과금되는 `tests/evals/`)는 돌리지 않는다.
+4. **낡은 base의 머지 결과.** `origin/$BASE`가 head의 조상이 아니면 임시 worktree에서 시험 머지(`git merge --no-commit --no-ff origin/$BASE` 뒤 `git merge --abort`)하고 바뀐 UNIT을 머지된 코드 기준으로 다시 본다. 머지한 뒤에만 깨지는 것은 finding이고, 텍스트 충돌은 메모다.
 
 **Round 3+:** preserve an unseeded discovery pass. Add explicitly targeted passes
 only where sweep results or changed contracts justify them, and label them as
@@ -226,8 +227,9 @@ HEAD_SHA=$(gh api repos/<REPO>/pulls/<PR> --jq .head.sha)   # Step 7의 --commit
 브랜치 전략 먼저 결정:
 ```bash
 CUR=$(git rev-parse --abbrev-ref HEAD); echo "PR head=<headRefName> / current=$CUR"
+[ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] && [ -z "$(git status --porcelain)" ] && echo same-branch
 ```
-- **same-branch:** Read 툴로 로컬 파일 직접 열람.
+- **same-branch:** 로컬 `HEAD`가 Step 2의 `HEAD_SHA`와 같고 작업 트리가 깨끗할 때만이다. 브랜치 이름이 같아도 로컬 사본은 예전 커밋이거나 커밋하지 않은 수정을 담고 있을 수 있다. 그렇지 않으면 different-branch로 간다. Read 툴로 로컬 파일 직접 열람.
 - **different-branch:** `git fetch origin <PR_HEAD> -q && git show origin/<PR_HEAD>:<path>` (파일 전체). call-site grep은 항상 로컬에서 가능.
   > **주의:** different-branch에서 `git diff --name-only <MB> HEAD`는 **현재 체크아웃 브랜치 기준**이라 사용 금지 — 변경 파일 목록은 Step 2의 diff(`+++ b/<path>`) 또는 스윕 출력에서 얻는다.
 
@@ -250,6 +252,7 @@ not merely an uncovered branch.
 정확성 밖의 네 관점. 코드가 맞아도 이 변경이 있어야 하는지, 이 모양이어야 하는지를 본다.
 
 3-6. **변경 의도.** PR 본문·커밋 메시지·티켓이 말하는 목적과 diff가 하는 일이 맞는가. 설명 없는 변경(목적과 무관한 파일, 끼어든 리팩토링)은 "왜 이 PR에 있나"를 묻는 finding이다(AGENTS.md "One Issue Per PR"). 목적 대비 변경이 과하면 더 작은 대안을 한 줄로 제시한다. 의도를 지어내지 않는다 — 설명이 없으면 없다고 쓴다.
+   **요구사항 대조.** 연결된 티켓이 있으면(PR 본문, 없으면 브랜치 이름) 완료 조건을 하나씩 충족·부분 충족·미충족으로 표시하고 충족하는 `file:line`을 단다. 티켓마다 체크리스트 하나다. PR이 충족한다고 한 조건을 못 채웠으면 티켓 문장을 인용한 finding이다. 티켓이 제외 범위로 둔 작업이 diff에 있으면 "왜 이 PR에 있나" finding이고, 티켓이 결정 대기로 둔 항목은 그 결론이 PR이나 티켓에 적혀 있어야 한다. 티켓 시스템에 접근할 수 없으면 본문을 요청하고, diff에서 요구사항을 추측하지 않는다.
 
 3-7. **중복 수정.** 스윕의 `DUP-*` HIT를 판정하고, 같은 파일을 건드리는 열린 PR을 확인한다:
 ```bash
@@ -344,6 +347,8 @@ fingerprint deduplication; a retitled version of the same claim stays in its thr
 2. **영향받는 코드를 짚을 수 있다.** "다른 곳이 깨질 수도"는 근거가 아니다 — 깨지는 호출부를 `file:line`으로 댄다.
 3. **실패 시나리오를 먼저 말할 수 있다.** 어떤 입력·상태에서 무엇이 잘못되는지. `explanation`의 첫 문장이 그 시나리오다. 특정 입력에서만 생기면 그 조건과, 심각도가 거기에 달렸다는 점을 적는다.
 4. **작성자가 알았다면 고쳤을 문제다.** 의도된 동작 변경(PR 설명·커밋 메시지에 적힌 것)은 결함이 아니다.
+
+PR이 충족한다고 한 요구사항을 충족하지 못한 경우(3-6의 요구사항 대조)는 깨지는 코드가 없어도 올린다. 그 동작이 있어야 할 줄에 달고 요구사항 문장을 인용한다.
 
 ### 올리지 않는 것
 - ruff·mypy·eslint가 잡는 것 (스윕의 린트 레인 HIT는 예외 — 판정 대상).
