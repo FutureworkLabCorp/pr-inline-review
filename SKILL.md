@@ -26,7 +26,7 @@ in `../code-review-sweep/finding-gate.md`; summarize completed cleanup once.
 | 인자 | 예시 | 설명 |
 |------|------|------|
 | PR 번호/URL | `634`, `https://github.com/.../pull/634` | 없으면 로컬 브랜치 리뷰(항상 dry-run) |
-| 저장소 | `FutureworkLabCorp/linkBrain-server` | 없으면 git remote 자동 탐지 |
+| 저장소 | `owner/repo` | 없으면 git remote 자동 탐지 |
 | dry-run | `--dry-run`, `dry-run`, `콘솔`, `출력만`, `게시하지`, `테스트` | 게시 skip |
 | fresh | `--fresh`, `fresh`, `기존 무시`, `skip-existing` | Step 1(기존 리뷰 조회)·재리뷰 모드 skip, 전체를 처음부터 |
 | depth | `--depth 2`, `깊게`, `심화` | Force analysis depth only; never pass this as `review_post.py --round`. |
@@ -72,7 +72,7 @@ git show "origin/$BASE:AGENTS.md"            # 1순위: Agent/리뷰 지침 (정
 git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가리키는 컨벤션 문서
 ```
 
-규칙 문서의 위치는 저장소마다 다르다(`docs/`, `.docs/`, 위키). AGENTS.md가 가리키는 곳을 따르고, 나머지 규칙 문서는 해당 주제가 diff에 있을 때만 읽는다(예: 테스트 갭이면 테스트 문서, 새 의존성이면 라이선스 문서). linkBrain-server는 규칙 문서를 `.docs/`에 둔다.
+규칙 문서의 위치는 저장소마다 다르다(`docs/`, `.docs/`, 위키). AGENTS.md가 가리키는 곳을 따르고, 나머지 규칙 문서는 해당 주제가 diff에 있을 때만 읽는다(예: 테스트 갭이면 테스트 문서, 새 의존성이면 라이선스 문서).
 
 메모할 기준: 최소 변경 원칙 / 기존 패턴 우선 / 보안·정확성·생명주기 우선 / 새 추상화는 real complexity를 제거할 때만 / 근거 없는 동의 금지.
 
@@ -80,8 +80,8 @@ git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가�
 
 **설계 패턴 레퍼런스(스킬 동봉):** `$SKILL_DIR/reference/patterns.md` — DB 컬럼 vs JSONB, hook/transaction 경계, ACL 적용 위치, RAG 파이프라인, lifecycle state machine 등 §1~§16 판단 기준. 전부 미리 읽지 말고 **Step 4에서 설계 판단이 걸리는 finding이 나올 때 해당 §만** 참조한다. (`$SKILL_DIR` = 이 SKILL.md가 있는 디렉토리의 절대경로)
 
-### 프로젝트 스택 (linkBrain-server 기준)
-Python, FastAPI, LangGraph, LangChain, PostgreSQL, SQLAlchemy, Alembic, Neo4j, Redis, Celery, Pydantic v2, mypy
+### 프로젝트 스택
+스택은 저장소의 `AGENTS.md`와 의존성 파일(`pyproject.toml`, `package.json` 등)에서 읽는다. 리뷰 축과 설계 패턴 레퍼런스는 그 스택에 해당하는 것만 적용한다.
 
 ---
 
@@ -192,7 +192,7 @@ controls investigation effort; the recorded round tracks published reviews only.
    the sweep and selects investigation paths. Reconcile with earlier findings after
    discovery; no findings is a valid result.
 2. **호출부 2홉.** `sweep.py ... --caller-depth 2`로 UNITS의 `callers2`를 받아, 반환 형태·예외·전제조건이 바뀐 함수만 호출부의 호출부까지 읽는다.
-3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: linkBrain-server의 과금되는 `tests/evals/`)는 돌리지 않는다.
+3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: 외부 API를 호출해 과금되는 평가 테스트)는 돌리지 않는다.
 4. **낡은 base의 머지 결과.** `origin/$BASE`가 head의 조상이 아니면 임시 worktree에서 시험 머지(`git merge --no-commit --no-ff origin/$BASE` 뒤 `git merge --abort`)하고 바뀐 UNIT을 머지된 코드 기준으로 다시 본다. 머지한 뒤에만 깨지는 것은 finding이고, 텍스트 충돌은 메모다.
 
 **Round 3+:** preserve an unseeded discovery pass. Add explicitly targeted passes
@@ -261,9 +261,9 @@ gh pr list --repo <REPO> --state open --json number,title,files \
 ```
 변경 파일이 겹치는 PR은 본문을 읽어, 같은 문제를 이미 고치고 있으면 finding(MEDIUM, 두 PR 번호와 겹치는 지점)이다. 겹치기만 하면 충돌 가능성을 `_summary`에 한 줄로 남긴다.
 
-3-8. **YAGNI 대 최적화.** 변경이 일반화(값이 하나뿐인 설정, 구현이 하나뿐인 추상화, 아무도 넘기지 않는 인자, 쓰이지 않는 확장 지점)나 최적화(캐시, 배치, 동시성, 사전 계산)를 들여오면 둘을 비교하는 finding을 쓴다. explanation은 세 가지를 담는다: 지금 치르는 비용(복잡도·읽는 사람의 부담·새 실패 경로), 얻는다는 이득과 그 근거(측정, 호출 빈도, 요구사항), 그리고 권고. 근거 없는 일반화는 YAGNI가 이긴다(AGENTS.md "Prefer minimal, focused changes"). 측정 없는 최적화는 막지 말고 수치를 요청한다. 반대로 단순한 쪽이 분명한 병목(루프 안 쿼리, 반복 I/O)을 만들면 최적화를 권한다. category는 `design`, 보통 MEDIUM/LOW.
+3-8. **YAGNI 대 최적화.** 변경이 일반화(값이 하나뿐인 설정, 구현이 하나뿐인 추상화, 아무도 넘기지 않는 인자, 쓰이지 않는 확장 지점)나 최적화(캐시, 배치, 동시성, 사전 계산)를 들여오면 둘을 비교하는 finding을 쓴다. explanation은 세 가지를 담는다: 지금 치르는 비용(복잡도·읽는 사람의 부담·새 실패 경로), 얻는다는 이득과 그 근거(측정, 호출 빈도, 요구사항), 그리고 권고. 근거 없는 일반화는 YAGNI가 이긴다(저장소에 같은 취지의 규칙이 있으면 그것을 인용한다). 측정 없는 최적화는 막지 말고 수치를 요청한다. 반대로 단순한 쪽이 분명한 병목(루프 안 쿼리, 반복 I/O)을 만들면 최적화를 권한다. category는 `design`, 보통 MEDIUM/LOW.
 
-3-9. **docstring·주석.** 스윕의 `DOC-*` HIT를 `reference/sweep-categories.md`대로 판정한다. 기준은 저장소의 주석 규칙이다(linkBrain-server는 `.docs/Code-Conventions.md` "Docstrings and comments"). 저장소 규칙이 더 엄격하면(예: "주석은 기본적으로 쓰지 않는다") 그것을 따르고, 규칙이 없으면 다음을 기본으로 한다: 코드가 말하지 못하는 것(왜 이 방식인지, 확인한 제약, 의존하는 외부 동작)만 남기고, 고친 경위·이전 동작·티켓 번호·시그니처 반복은 지운다. 길이 자체는 지적하지 않는다 — 지울 문장을 인용한다. 줄인 판본이 6줄 이하면 suggestion으로 단다. 이 변경이 쓰지 않은 기존 docstring은 대상이 아니다.
+3-9. **docstring·주석.** 스윕의 `DOC-*` HIT를 `reference/sweep-categories.md`대로 판정한다. 기준은 저장소의 주석 규칙이다. 저장소 규칙이 더 엄격하면(예: "주석은 기본적으로 쓰지 않는다") 그것을 따르고, 규칙이 없으면 다음을 기본으로 한다: 코드가 말하지 못하는 것(왜 이 방식인지, 확인한 제약, 의존하는 외부 동작)만 남기고, 고친 경위·이전 동작·티켓 번호·시그니처 반복은 지운다. 길이 자체는 지적하지 않는다 — 지울 문장을 인용한다. 줄인 판본이 6줄 이하면 suggestion으로 단다. 이 변경이 쓰지 않은 기존 docstring은 대상이 아니다.
 
 ---
 
@@ -315,7 +315,7 @@ removed guard in a local artifact or console output. Do not publish coverage log
 reviewer rosters or investigation checklists in `_summary`, even in collapsed blocks.
 Publish only the verdict, blockers and material verification limits (AGENTS.md).
 
-**린터 정책 (ruff / eslint).** ruff(Python)는 순수 정적 린트라 항상 돈다. **eslint(TypeScript)**는 트리의 `node_modules`(플러그인·파서·tsconfig)가 필요해 **local-only**다 — 스캔 트리에 `node_modules/.bin/eslint`가 있을 때만 자동 실행되고, 없으면 조용히 skip(경고 한 줄)된다. 그래서 worktree(리모트 PR)엔 `node_modules`가 없어 eslint는 기본 빠지고 regex·AST·dead-code·ruff는 정상 동작한다. eslint까지 강제하려면 원본 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고 **TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: AxFlow `pr-code-review`)에 맡긴다**.
+**린터 정책 (ruff / eslint).** ruff(Python)는 순수 정적 린트라 항상 돈다. **eslint(TypeScript)**는 트리의 `node_modules`(플러그인·파서·tsconfig)가 필요해 **local-only**다 — 스캔 트리에 `node_modules/.bin/eslint`가 있을 때만 자동 실행되고, 없으면 조용히 skip(경고 한 줄)된다. 그래서 worktree(리모트 PR)엔 `node_modules`가 없어 eslint는 기본 빠지고 regex·AST·dead-code·ruff는 정상 동작한다. eslint까지 강제하려면 원본 `node_modules`를 worktree에 심볼릭 링크한 뒤 `--linter`를 붙인다 — 이 비용(설치본 공유·타입 정보 로딩)이 부담되면 그대로 skip하고 **TS 정밀 린트는 해당 레포 자체 리뷰 스킬(예: 저장소의 `pr-code-review`)에 맡긴다**.
 
 The sibling `code-review-sweep` skill supplies discovery. Optional runtime lanes
 (Ruff, ESLint, tree-sitter and Jedi) use the project environment and report missing
