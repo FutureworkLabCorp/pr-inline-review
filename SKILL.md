@@ -66,7 +66,8 @@ gh auth switch --user <org 권한 있는 handle>
 ```bash
 # PR이 규칙 문서 자체를 바꿨을 수 있으니 base 브랜치 판본을 기준으로 삼는다
 # BASE = PR의 baseRefName (gh pr view <PR> --json baseRefName),
-#        로컬 리뷰면 원격 기본 브랜치 (git symbolic-ref --short refs/remotes/origin/HEAD)
+#        로컬 리뷰면 원격 기본 브랜치. symbolic-ref는 origin/<branch>를 돌려주므로 origin/을 뗀다:
+#        BASE=$(git symbolic-ref --short refs/remotes/origin/HEAD); BASE=${BASE#origin/}
 git fetch origin "$BASE" -q
 git show "origin/$BASE:AGENTS.md"            # 1순위: Agent/리뷰 지침 (정본). 없으면 CLAUDE.md
 git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가리키는 컨벤션 문서
@@ -193,7 +194,7 @@ controls investigation effort; the recorded round tracks published reviews only.
    discovery; no findings is a valid result.
 2. **호출부 2홉.** `sweep.py ... --caller-depth 2`로 UNITS의 `callers2`를 받아, 반환 형태·예외·전제조건이 바뀐 함수만 호출부의 호출부까지 읽는다.
 3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: 외부 API를 호출해 과금되는 평가 테스트)는 돌리지 않는다.
-4. **낡은 base의 머지 결과.** `origin/$BASE`가 head의 조상이 아니면 임시 worktree에서 시험 머지(`git merge --no-commit --no-ff origin/$BASE` 뒤 `git merge --abort`)하고 바뀐 UNIT을 머지된 코드 기준으로 다시 본다. 머지한 뒤에만 깨지는 것은 finding이고, 텍스트 충돌은 메모다.
+4. **낡은 base의 머지 결과.** `origin/$BASE`가 head의 조상이 아니면 임시 worktree에서 시험 머지(`git merge --no-commit --no-ff origin/$BASE`)한 상태로 바뀐 UNIT을 머지된 코드 기준으로 다시 보고 좁은 검사를 돌린 뒤, 마지막에 `git merge --abort`로 되돌린다. 머지한 뒤에만 깨지는 것은 finding이고, 텍스트 충돌은 메모다.
 
 **Round 3+:** preserve an unseeded discovery pass. Add explicitly targeted passes
 only where sweep results or changed contracts justify them, and label them as
