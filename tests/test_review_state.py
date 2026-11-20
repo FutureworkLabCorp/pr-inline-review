@@ -57,6 +57,18 @@ def test_clean_removes_nested_folded_blocks():
     assert S.clean(body) == "before after"
 
 
+def test_clean_keeps_quoted_markup_inside_code_spans():
+    assert S.clean("nested `<details>` leaves a lone `</details>` word. Fix") == \
+        "nested `<details>` leaves a lone `</details>` word. Fix"
+    assert S.clean("an open `<!--` quote <!-- hidden --> stays") == "an open `<!--` quote stays"
+
+
+def test_new_js_module_file_runs_discovery():
+    added = {"status": "ahead", "files": [
+        {"filename": "mock/x.mjs", "status": "added", "additions": 80, "deletions": 0}]}
+    assert S.discovery(3, added)[0] == "run"
+
+
 def test_review_lines_show_bodies_and_skip_empty_ones():
     reviews = [
         {"user": {"login": "lead"}, "state": "CHANGES_REQUESTED", "commit_id": "abcdef1234567890",

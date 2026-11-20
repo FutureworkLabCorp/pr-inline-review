@@ -140,6 +140,7 @@ uv run python "$SKILL_DIR/tests/test_diff_map.py"
 uv run python "$SKILL_DIR/tests/test_wiki_links.py"
 uv run python "$SKILL_DIR/tests/test_sweep.py"
 uv run python "$SKILL_DIR/tests/test_setup_check.py"
+uv run --with pytest python -m pytest -q "$SKILL_DIR/tests/test_review_state.py"   # uses pytest's tmp_path
 uv run python "$SKILL_DIR/../code-review-sweep/tests/test_sweep.py"
 ```
 

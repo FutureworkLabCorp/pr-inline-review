@@ -24,7 +24,7 @@ sys.path.insert(0, HERE)
 import review_lib as R  # noqa: E402
 import review_post as P  # noqa: E402
 
-CODE_EXT = (".py", ".ts", ".tsx", ".js", ".jsx", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp",
+CODE_EXT = (".py", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".sh", ".c", ".cc", ".cpp", ".h", ".hpp",
             ".go", ".rs", ".java", ".kt", ".sql", ".toml", ".yaml", ".yml")
 DISCOVERY_LINES = 200
 
@@ -36,13 +36,25 @@ query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)
 
 
 def clean(body: str, limit: int = 140) -> str:
-    """Comment text without hidden markers, folded blocks, badges or markup noise."""
-    text = re.sub(r"<!--.*?-->", " ", body or "", flags=re.S)
+    """Comment text without hidden markers, folded blocks, badges or markup noise.
+
+    Inline code is set aside first: a review that quotes `<details>` or `<!--`
+    must keep the quote and the text after it.
+    """
+    spans: list = []
+
+    def keep(m):
+        spans.append(m.group(0))
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = re.sub(r"`[^`\n]+`", keep, body or "")
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
     inner = re.compile(r"<details>(?:(?!<details>).)*?</details>", re.S)
     while inner.search(text):  # innermost first, so nested blocks go whole
         text = inner.sub(" ", text)
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
     text = re.sub(r"</?(sub|sup|b|strong|br)\s*/?>", " ", text)
+    text = re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], text)
     text = re.sub(r"\s+", " ", text).strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
 

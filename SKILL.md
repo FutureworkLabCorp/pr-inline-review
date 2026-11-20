@@ -184,7 +184,7 @@ is `unverified`. A resolved thread or changed line alone does not establish clos
 |---|---|---|---|
 | 1 | Entire PR | Default passes, including REMOVED, DOC and DUP | None |
 | 2 | Prior findings and increment; one discovery pass covers the PR | Independent discovery, callers two hops out, narrow tests | None |
-| 3+ | Prior findings and increment | Callers two hops out and narrow tests on the increment; independent discovery only when `review_state.py` says `run` | None |
+| 3+ | Prior findings and increment | Callers two hops out, narrow tests and the stale-base merge on the increment; independent discovery only when `review_state.py` says `run` | None |
 
 **Convergence comes from evidence and deduplication.** Report verified defects at
 every severity in every round, including defects missed earlier. Keep taste-only
@@ -204,14 +204,18 @@ controls investigation effort; the recorded round tracks published reviews only.
 
 **Round 3+:** run the unseeded discovery pass again only when `review_state.py`
 prints `discovery: run`. That happens when the last reviewed head is not an
-ancestor, the increment adds code files, or it changes 200 or more lines. Otherwise
-the whole PR already had a neutral pass in round 2.
+ancestor, the increment adds code files, or it changes 200 or more lines. The
+measure is the last increment alone. Code that arrived after round 2 in several
+small increments gets no neutral pass; each of those increments was covered by the
+targeted checks of its own round.
 
-A small fix is covered by four checks:
+A small fix is covered by these checks:
 - re-run each prior finding's original failure path;
 - the increment sweep;
 - callers two hops out of the changed units;
-- the narrow tests.
+- the narrow tests;
+- the stale-base merge result (round 2 pass 4) when `origin/$BASE` is not an
+  ancestor of the head.
 
 A neutral pass over a few changed lines costs about as much as the rest of the round
 and has repeated what the targeted checks found. State in `_summary` that discovery
