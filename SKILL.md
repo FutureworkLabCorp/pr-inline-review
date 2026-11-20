@@ -19,6 +19,12 @@ The posting helper consumes structured findings JSON. When PR modification is
 already authorized, also apply small corrections under the shared handling policy
 in `../code-review-sweep/finding-gate.md`; summarize completed cleanup once.
 
+**비용 규칙.** 리뷰 비용은 호출 수 × 그때의 맥락 크기다. 맥락에 들어간 것은 리뷰가 끝날 때까지 매 호출 다시 읽힌다.
+- 서로 기대지 않는 조회(파일 여러 개, `gh` 조회, `git show`)는 한 메시지에서 병렬로 부른다.
+- 시작 상태는 `scripts/review_state.py` 한 번으로 받는다(Step 1).
+- 큰 문서는 필요한 절만 읽는다. `reference/*`는 해당 §만, `finding-gate.md`는 판정에 걸리는 절만 읽는다.
+- 재리뷰는 증분이 건드린 범위만 다시 읽는다(Step 1-R).
+
 ---
 
 ## 인자 파싱
@@ -37,7 +43,9 @@ in `../code-review-sweep/finding-gate.md`; summarize completed cleanup once.
 
 ---
 
-## Step S. 셋업 체크 (최초 1회 / 문제 발생 시)
+## Step S. 셋업 체크 (문제 발생 시)
+
+Step 1의 `review_state.py`가 `siblings MISSING`을 내거나 `gh` 호출이 실패할 때만 돌린다.
 
 ```bash
 SKILL_DIR=<이 SKILL.md가 있는 디렉토리의 절대경로>
@@ -102,20 +110,17 @@ git show "origin/$BASE:<컨벤션 문서 경로>"   # 2순위: AGENTS.md가 가�
 **클라우드 에이전트보다 유리한 첫 번째 이유: 이미 논의된 걸 다시 지적하지 않는다.**
 
 ```bash
-gh pr view <PR> --repo <REPO> --json number,title,body,baseRefName,headRefName,isDraft,state
-gh api --paginate repos/<REPO>/pulls/<PR>/reviews --jq '.[] | "\(.id) \(.user.login) \(.state) \(.commit_id[0:12]): \(.body[0:200])"'
-gh api --paginate repos/<REPO>/issues/<PR>/comments --jq '.[] | "@\(.user.login): \(.body[0:240])"'
+uv run --no-project python "$SKILL_DIR/scripts/review_state.py" --repo <REPO> --pr <PR>
 ```
 
-인라인 스레드는 GraphQL로 읽는다. REST `pulls/comments`에는 스레드의 resolved 여부가 없고, 답글이 따로 흩어져서 "작성자가 반박했는가"를 판단할 수 없다.
+한 번에 다음을 낸다.
+- PR 상태 · base · head, 다음 회차, 형제 스킬 설치 여부
+- 마지막으로 리뷰한 head 이후의 증분(파일별 줄 수, 조상 여부)과 남은 지적(지문 · 심각도 · 위치 · 제목)
+- 이번 회차의 독립 발견 여부(`discovery: run|skip`)
+- 인라인 스레드 한 줄씩(상태 · 위치 · 첫 코멘트 ID · 지문 · 반응 · 마지막 답글 요약). GraphQL로 읽으니 resolved 여부와 반박 답글이 보인다.
+- 이슈 코멘트 작성자와 최근 코멘트
 
-```bash
-gh api graphql -F owner=<OWNER> -F name=<NAME> -F pr=<PR> -f query='
-query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){pullRequest(number:$pr){
-  reviewThreads(first:100){nodes{isResolved isOutdated path line
-    comments(first:30){nodes{databaseId author{login} body reactionGroups{content reactors{totalCount}}}}}}}}}' \
-  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | "\(if .isResolved then "RESOLVED" elif .isOutdated then "OUTDATED" else "OPEN" end) \(.path):\(.line) #\(.comments.nodes[0].databaseId) " + ([.comments.nodes[] | "@\(.author.login)\([.reactionGroups[] | select(.reactors.totalCount>0) | " [\(.content)=\(.reactors.totalCount)]"] | join("")): \(.body[0:160] | gsub("\n";" "))"] | join(" / "))'
-```
+봇 상용구와 숨김 마커는 잘라서 보인다. PR 본문과 판정에 본문 전체가 필요한 스레드만 따로 읽는다(`gh pr view <PR> --json body`, `gh api repos/<REPO>/pulls/comments/<ID>`).
 
 판단:
 - 👎(`THUMBS_DOWN`) 반응 / PR author 반박 / RESOLVED / 동일 파일·줄 동일 지적 → **해당 이슈 제외**.
@@ -132,7 +137,8 @@ query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)
 1. **증분 diff:** `git fetch origin <PR_HEAD> -q && git diff <marker.sha> FETCH_HEAD`. `marker.sha`가 head의 조상이 아니면(force-push·rebase) 증분은 믿을 수 없다 — 전체 리뷰로 돌아가고 그 사실을 `_summary`에 적는다.
 2. **이전 finding마다 판정** (빠짐없이): `fixed`(코드로 확인, 고친 커밋 명시) / `open`(그대로) / `rebutted-accepted`(작성자 반박이 맞음) / `rebutted-rejected`(반박이 틀림, 근거 제시) / `outdated`(코드가 사라져 판정 불가). 작성자의 "Addressed in <sha>" 답글은 주장일 뿐이다 — 그 커밋의 코드를 읽고 판정한다.
 3. **스레드 답글:** `fixed`·`rebutted-*`는 해당 스레드에 한두 문장으로 답한다(`gh api repos/<REPO>/pulls/<PR>/comments/<첫 코멘트 databaseId>/replies -f body=...`). 같은 지적을 새 코멘트로 다시 달지 않는다.
-4. **새 finding:** 기본 절차는 증분 diff에서만 돈다(Step 3-A 스윕도 `--base <marker.sha>`). 그 위에 아래 "회차별 깊이"의 심화 패스가 PR 전체를 본다. 증분이 새로 만든 문제는 finding에 `"introduced_by_increment": true`를 단다.
+4. **새 finding:** 기본 절차는 증분 diff에서만 돈다(Step 3-A 스윕도 `--base <marker.sha>`). 그 위에 아래 "회차별 깊이"의 심화 패스가 더해진다. 증분이 새로 만든 문제는 finding에 `"introduced_by_increment": true`를 단다.
+   **읽기 범위:** 증분이 건드린 UNIT, 이전 지적이 가리키는 범위, 그 판정에 필요한 호출부만 `Read(offset, limit)`로 읽는다. 이전 회차가 읽은 파일을 통째로 다시 읽지 않는다. 증분 밖을 다시 보는 일은 독립 발견 패스(`discovery: run`일 때)가 맡는다.
 
 Before finalizing these dispositions and new findings, apply the shared gate's
 "Repeated topics and stopping" and "Fix recommendations and closure" sections.
@@ -177,8 +183,8 @@ is `unverified`. A resolved thread or changed line alone does not establish clos
 | Round | Scope | Added analysis | Severity floor |
 |---|---|---|---|
 | 1 | Entire PR | Default passes, including REMOVED, DOC and DUP | None |
-| 2 | Prior findings and increment; deep passes cover the PR | Gap sweep, callers two hops out, narrow tests | None |
-| 3+ | Same as round 2 | Independent angles and per-candidate verification | None |
+| 2 | Prior findings and increment; one discovery pass covers the PR | Independent discovery, callers two hops out, narrow tests | None |
+| 3+ | Prior findings and increment | Callers two hops out, narrow tests and the stale-base merge on the increment; independent discovery only when `review_state.py` says `run` | None |
 
 **Convergence comes from evidence and deduplication.** Report verified defects at
 every severity in every round, including defects missed earlier. Keep taste-only
@@ -196,9 +202,25 @@ controls investigation effort; the recorded round tracks published reviews only.
 3. **좁은 테스트 실행.** 바뀐 코드를 덮는 테스트 경로만 worktree에서 저장소가 정한 좁은 테스트 명령(AGENTS.md; 예: `uv run pytest <경로>`, `pnpm exec vitest run <경로>`)으로 돌린다. 실패는 근거가 확실한 finding이다(출력 일부를 explanation에 인용). 테스트 환경(예: `.env.pytest`, DB, `node_modules`)이 없어 못 돌리면 건너뛰고 `_summary`에 그렇다고 적는다. AGENTS.md가 돌리지 말라는 테스트(예: 외부 API를 호출해 과금되는 평가 테스트)는 돌리지 않는다.
 4. **낡은 base의 머지 결과.** `origin/$BASE`가 head의 조상이 아니면 임시 worktree에서 시험 머지(`git merge --no-commit --no-ff origin/$BASE`)한 상태로 바뀐 UNIT을 머지된 코드 기준으로 다시 보고 좁은 검사를 돌린 뒤, 마지막에 `git merge --abort`로 되돌린다. 머지한 뒤에만 깨지는 것은 finding이고, 텍스트 충돌은 메모다.
 
-**Round 3+:** preserve an unseeded discovery pass. Add explicitly targeted passes
-only where sweep results or changed contracts justify them, and label them as
-targeted rather than neutral. Reconcile by root cause before candidate verification.
+**Round 3+:** run the unseeded discovery pass again only when `review_state.py`
+prints `discovery: run`. That happens when the last reviewed head is not an
+ancestor, the increment adds code files, or it changes 200 or more lines. The
+measure is the last increment alone. Code that arrived after round 2 in several
+small increments gets no neutral pass; each of those increments was covered by the
+targeted checks of its own round.
+
+A small fix is covered by these checks:
+- re-run each prior finding's original failure path;
+- the increment sweep;
+- callers two hops out of the changed units;
+- the narrow tests;
+- the stale-base merge result (round 2 pass 4) when `origin/$BASE` is not an
+  ancestor of the head.
+
+A neutral pass over a few changed lines costs about as much as the rest of the round
+and has repeated what the targeted checks found. State in `_summary` that discovery
+was skipped and why. Add explicitly targeted passes only where sweep results or
+changed contracts justify them, and label them as targeted rather than neutral. Reconcile by root cause before candidate verification.
 If the same requirement attracts successive defensive fixes, apply the shared
 gate's stopping rule before recommending another rewrite.
 In particular, two fixes sharing a premise that fail the same behavioral check
@@ -525,7 +547,7 @@ uv run --no-project python "$SKILL_DIR/scripts/review_post.py" --repo <REPO> --p
 ## 요약 흐름
 
 ```
-setup_check → 가이드 로드(base 판본) → (기존 리뷰·스레드 읽기 → 마커 있으면 재리뷰 1-R)
+review_state(상태 · 증분 · 스레드 · discovery 판정 한 번에; 문제 있으면 setup_check) → 가이드 로드(base 판본) → (마커 있으면 재리뷰 1-R, 증분 범위만 읽기)
    → diff 수집 + HEAD_SHA 고정
    → sweep.py(HITS/MANUAL 후보 + REMOVED + UNITS 읽기 바닥선) → 소스 정밀 분석
      + 의도·중복·YAGNI 대 최적화·docstring → (2회차+) 심화 패스 → findings 초안
