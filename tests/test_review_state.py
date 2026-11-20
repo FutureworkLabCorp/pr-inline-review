@@ -52,6 +52,33 @@ def test_thread_lines_carry_state_fingerprint_votes_and_last_reply():
         " || 1 repl(y/ies), last @dev: Addressed in abc"]
 
 
+def test_clean_removes_nested_folded_blocks():
+    body = "before <details>a <details>b</details> c</details> after"
+    assert S.clean(body) == "before after"
+
+
+def test_review_lines_show_bodies_and_skip_empty_ones():
+    reviews = [
+        {"user": {"login": "lead"}, "state": "CHANGES_REQUESTED", "commit_id": "abcdef1234567890",
+         "body": "Please split this PR. <!-- pr-inline-review:v1 {\"sha\":\"x\"} -->"},
+        {"user": {"login": "bot"}, "state": "COMMENTED", "commit_id": "1234", "body": ""}]
+    assert S.review_lines(reviews) == ["@lead CHANGES_REQUESTED abcdef123456: Please split this PR."]
+
+
+def test_siblings_follow_a_symlinked_skill_directory(tmp_path):
+    real = tmp_path / "standalone" / "pr-inline-review"
+    real.mkdir(parents=True)
+    layout = tmp_path / "layout"
+    layout.mkdir()
+    for d, f in [("code-review-sweep", "sweep.py"), ("code-review-sweep", "finding-gate.md"),
+                 ("review-rediagnose", "SKILL.md")]:
+        (layout / d).mkdir(exist_ok=True)
+        (layout / d / f).write_text("")
+    (layout / "pr-inline-review").symlink_to(real)
+    # The sweep entry point resolves the link, so the siblings beside the link do not count.
+    assert len(S.siblings(str(layout / "pr-inline-review"))) == 3
+
+
 def test_siblings_reports_missing_dependencies(tmp_path):
     skill = tmp_path / "pr-inline-review"
     skill.mkdir()

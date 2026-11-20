@@ -38,7 +38,9 @@ query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)
 def clean(body: str, limit: int = 140) -> str:
     """Comment text without hidden markers, folded blocks, badges or markup noise."""
     text = re.sub(r"<!--.*?-->", " ", body or "", flags=re.S)
-    text = re.sub(r"<details>.*?</details>", " ", text, flags=re.S)
+    inner = re.compile(r"<details>(?:(?!<details>).)*?</details>", re.S)
+    while inner.search(text):  # innermost first, so nested blocks go whole
+        text = inner.sub(" ", text)
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
     text = re.sub(r"</?(sub|sup|b|strong|br)\s*/?>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -63,6 +65,17 @@ def thread_lines(nodes: list) -> list:
             line += (f" || {total - 1} repl(y/ies), last @{(last.get('author') or {}).get('login')}: "
                      f"{clean(last.get('body'), 100)}")
         out.append(line)
+    return out
+
+
+def review_lines(reviews: list) -> list:
+    """Review bodies, including summaries that carry no inline comment."""
+    out = []
+    for r in reviews:
+        text = clean(r.get("body"), 160)
+        if text:
+            out.append(f"@{(r.get('user') or {}).get('login')} {r.get('state')} "
+                       f"{(r.get('commit_id') or '')[:12]}: {text}")
     return out
 
 
@@ -91,7 +104,7 @@ def discovery(round_next: int, increment: dict | None, lines: int = DISCOVERY_LI
 
 
 def siblings(skill_dir: str) -> list:
-    root = os.path.dirname(os.path.abspath(skill_dir))
+    root = os.path.dirname(os.path.realpath(skill_dir))  # as setup_check and sweep.py resolve it
     need = [("code-review-sweep", "sweep.py"), ("code-review-sweep", "finding-gate.md"),
             ("review-rediagnose", "SKILL.md")]
     return [f"{d}/{f}" for d, f in need if not os.path.isfile(os.path.join(root, d, f))]
@@ -115,7 +128,11 @@ def main(argv=None) -> int:
 
     meta = _gh_json(["pr", "view", str(a.pr), "-R", repo, "--json",
                      "title,state,isDraft,baseRefName,headRefName,headRefOid,author"])
-    markers = P.fetch_prior_markers(repo, a.pr)
+    p = P._run(["gh", "api", "--paginate", f"repos/{repo}/pulls/{a.pr}/reviews"], check=False)
+    if p.returncode != 0:
+        raise SystemExit(f"Cannot read reviews; refusing to assume round 1: {p.stderr.strip()[:160]}")
+    reviews = P._json_pages(p.stdout)
+    markers = [m for m in (R.parse_state_marker(r.get("body") or "") for r in reviews) if m]
     round_next = R.review_round(markers)
     head = meta["headRefOid"]
     print(f"PR {repo}#{a.pr} {meta['state']} draft={meta['isDraft']} "
@@ -128,8 +145,12 @@ def main(argv=None) -> int:
     increment = None
     if markers:
         last = markers[-1]["sha"]
-        increment = _gh_json(["api", f"repos/{repo}/compare/{last}...{head}", "--jq",
-                              "{status, files: [.files[] | {filename, status, additions, deletions}]}"])
+        p = P._run(["gh", "api", f"repos/{repo}/compare/{last}...{head}", "--jq",
+                    "{status, files: [.files[] | {filename, status, additions, deletions}]}"],
+                   check=False)
+        # After a force push the old head may be gone; that is the full-review case.
+        increment = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else \
+            {"status": "unavailable", "files": []}
         files = increment.get("files") or []
         print(f"round: next={round_next} last_reviewed={last[:12]} compare={increment.get('status')}")
         for f in files[:15]:
@@ -152,6 +173,10 @@ def main(argv=None) -> int:
                      "-F", f"pr={a.pr}", "-f", f"query={THREADS_QUERY}"])
     nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
     lines = thread_lines(nodes)
+    bodies = review_lines(reviews)
+    print(f"reviews: {len(reviews)} ({len(bodies)} with a body)")
+    for line in bodies:
+        print("  " + line)
     print(f"threads: {len(lines)}")
     for line in lines:
         print("  " + line)
