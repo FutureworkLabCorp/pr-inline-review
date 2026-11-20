@@ -40,8 +40,11 @@ and retention rules.
 
 ## Depth, evidence and convergence
 
-Round 1 covers the whole PR. Round 2 adds a fresh-context gap sweep, callers two hops
-out and focused tests. Later rounds add independent review angles.
+Round 1 covers the whole PR. Round 2 adds one fresh-context discovery pass over the
+whole PR, callers two hops out and focused tests. Later rounds re-check prior findings
+and the increment; they repeat the discovery pass only when `scripts/review_state.py`
+reports a rewritten history, new code files or an increment of 200 or more lines.
+That script also gives a round its starting state in one call.
 
 Depth never suppresses verified LOW or MEDIUM defects. Convergence comes from
 excluding taste-only proposals and answering repeated findings in their existing
